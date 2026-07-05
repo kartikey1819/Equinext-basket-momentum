@@ -33,11 +33,19 @@ def read_valuation_series(symbol: str, end, lookback_years: int = 7) -> pd.DataF
     try:
         try:
             df = pd.read_sql(
-                "SELECT date, pe, pb, ev_ebitda FROM valuation_series WHERE symbol = ?",
+                "SELECT date, pe, pb, ev_ebitda, fcf_yield, eps_ttm "
+                "FROM valuation_series WHERE symbol = ?",
                 con, params=(symbol,),
             )
         except Exception:
-            df = pd.DataFrame()
+            # older DB without the extra columns — fall back to the core three
+            try:
+                df = pd.read_sql(
+                    "SELECT date, pe, pb, ev_ebitda FROM valuation_series WHERE symbol = ?",
+                    con, params=(symbol,),
+                )
+            except Exception:
+                df = pd.DataFrame()
     finally:
         con.close()
 

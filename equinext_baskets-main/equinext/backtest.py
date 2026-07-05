@@ -71,9 +71,9 @@ class BacktestResult:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _month_end_trading_days(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """Last actual trading day of each month present in `idx`."""
-    per = idx.to_period("M")
+def _period_end_trading_days(idx: pd.DatetimeIndex, freq: str = "M") -> pd.DatetimeIndex:
+    """Last actual trading day of each period (freq 'M' month / 'Q' quarter)."""
+    per = idx.to_period(freq)
     last = pd.Series(idx, index=per).groupby(level=0).last()
     return pd.DatetimeIndex(sorted(last.values))
 
@@ -141,7 +141,8 @@ def run_backtest(basket: Basket, ctx, cfg: BacktestConfig) -> BacktestResult:
     if len(days) == 0:
         raise ValueError("No trading days in the backtest window.")
     daily_ret = px.pct_change(fill_method=None)
-    rebal_dates = _month_end_trading_days(days)
+    freq = "Q" if str(cfg.rebalance).upper().startswith("Q") else "M"
+    rebal_dates = _period_end_trading_days(days, freq)
 
     returns = pd.Series(index=days, dtype=float)
     after_tax = pd.Series(index=days, dtype=float)

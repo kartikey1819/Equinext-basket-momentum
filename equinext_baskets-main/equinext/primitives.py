@@ -47,6 +47,41 @@ def valuation_percentile(series: pd.Series, end, years: int = 5) -> float:
     return float((w < cur).mean())
 
 
+_EXPENSIVE_WHEN_HIGH = ("pe", "pb", "ev_ebitda")   # higher multiple = richer
+_EXPENSIVE_WHEN_LOW = ("fcf_yield",)               # higher yield = cheaper (invert)
+
+
+def valuation_froth_percentile(vdf: pd.DataFrame, end, years: int = 5,
+                               min_obs: int = 60) -> float:
+    """Composite own-history 'expensiveness' percentile (0-1) across whatever
+    multiples are populated for this name. 0 = cheapest vs its own history on
+    every available multiple; 1 = richest. Financials contribute pe+pb only;
+    fcf_yield is inverted (high yield = cheap). nan if nothing usable.
+
+    This is the froth GATE for valuation-momentum: momentum ranks, this filters
+    out names trading rich vs their own past.
+    """
+    s = vdf.copy()
+    s["date"] = pd.to_datetime(s["date"])
+    s = s.set_index("date").sort_index()
+    pctiles = []
+    for col in _EXPENSIVE_WHEN_HIGH:
+        if col in s.columns:
+            ser = pd.to_numeric(s[col], errors="coerce").dropna()
+            if len(ser) >= min_obs:
+                p = valuation_percentile(ser, end, years)
+                if not np.isnan(p):
+                    pctiles.append(p)
+    for col in _EXPENSIVE_WHEN_LOW:
+        if col in s.columns:
+            ser = pd.to_numeric(s[col], errors="coerce").dropna()
+            if len(ser) >= min_obs:
+                p = valuation_percentile(ser, end, years)
+                if not np.isnan(p):
+                    pctiles.append(1.0 - p)     # high yield -> low expensiveness
+    return float(np.mean(pctiles)) if pctiles else np.nan
+
+
 def rerating_decomposition(price_return: float, earnings_growth: float) -> tuple[float, float]:
     """Split a holding-period return into earnings-driven vs multiple-driven parts.
     Identity: (1+r) = (1+earnings_growth)*(1+multiple_change).
@@ -70,6 +105,46 @@ def momentum_12_1(close: pd.Series, end) -> float:
     if not p_then or np.isnan(p_then) or not p_now or np.isnan(p_now):
         return np.nan
     return float(p_now / p_then - 1)
+
+
+def return_over(close: pd.Series, end, months: int) -> float:
+    """Simple price return over the trailing `months` window ending `end`."""
+    end = pd.Timestamp(end)
+    s = close[close.index <= end].dropna()
+    if s.empty:
+        return np.nan
+    p_now = s.asof(end)
+    p_then = s.asof(end - pd.Timedelta(days=int(months * 30.44)))
+    if not p_then or np.isnan(p_then) or not p_now or np.isnan(p_now):
+        return np.nan
+    return float(p_now / p_then - 1)
+
+
+def distance_from_high(close: pd.Series, end, weeks: int = 52) -> float:
+    """Where the latest close sits vs its trailing `weeks`-high, in [0, 1].
+    1.0 = at a new high; 0.85 = 15% below the high. Grinblatt-Han's 52-week-high
+    anchoring signal — nearness to the high predicts continuation. Higher = stronger.
+    """
+    end = pd.Timestamp(end)
+    s = close[close.index <= end].dropna()
+    s = s[s.index >= end - pd.Timedelta(weeks=weeks)]
+    if s.empty:
+        return np.nan
+    hi = s.max()
+    return float(s.iloc[-1] / hi) if hi else np.nan
+
+
+def volume_trend(volume: pd.Series, end, short: int = 21, long: int = 126) -> float:
+    """Ratio of recent (short) to baseline (long) average volume, minus 1.
+    Positive = participation is picking up (confirms a move); ~0 = steady.
+    The one momentum signal roughly orthogonal to price momentum.
+    """
+    end = pd.Timestamp(end)
+    v = volume[volume.index <= end].dropna()
+    if len(v) < long:
+        return np.nan
+    s, l = v.iloc[-short:].mean(), v.iloc[-long:].mean()
+    return float(s / l - 1) if l else np.nan
 
 
 def realized_vol(close: pd.Series, end, days: int = 252) -> float:

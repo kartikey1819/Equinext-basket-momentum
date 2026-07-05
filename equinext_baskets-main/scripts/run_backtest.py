@@ -1,17 +1,25 @@
 """
-Run the Relative Value basket backtest on the loaded Nifty 50 data.
+Run any basket's backtest on the loaded Nifty 50 data, vs the NIFTY50 index.
 
-Prereq: python scripts/load_nifty50_data.py  (fills prices + valuation_series).
+    python scripts/run_backtest.py relative_value
+    python scripts/run_backtest.py valuation_momentum --rebalance Q --band 0.03
+    python scripts/run_backtest.py valuation_momentum --rebalance M
 
-Window is auto-derived from the data: starts 12 months after the earliest P/E
-row (so every name can clear MIN_PE_OBS before its first possible selection),
-ends at the last trading day. Monthly rebalance, 25 bps/side costs, FIFO
-STCG/LTCG — all from the shared harness (equinext/backtest.py).
+Args:
+  <basket>       relative_value | valuation_momentum
+  --rebalance    M (month-end, default) | Q (quarter-end)   [turnover lever]
+  --band FLOAT   no-trade band, e.g. 0.03 = keep a name unless its target moves >3%
 
-Benchmark: NIFTY50 price index (^NSEI). Both legs are PRICE returns (no
-dividends on either side) — comparable, but understates absolute CAGR ~1-1.5%.
+Window auto-derived: 12 months after the first valuation row (so froth/quality
+gates have history), to the last trading day. 25 bps/side costs, FIFO STCG/LTCG.
 
-    python scripts/run_backtest.py
+Benchmark: NIFTY50 price index (^NSEI). Both legs are PRICE returns (no dividends
+on either side) — comparable, but understates absolute CAGR ~1-1.5% (use TRI later).
+
+Outputs (per basket, so runs don't clobber each other):
+  backtest_<basket>.csv               daily returns (basket / after-tax / nifty50)
+  exports/backtest_monthly_<basket>.csv   month-by-month analysis
+  basket_holdings table               holdings + scores audit trail
 """
 from __future__ import annotations
 import sys
@@ -23,38 +31,58 @@ import pandas as pd
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from equinext.context import ResearchContext          # noqa: E402
+from equinext.context import ResearchContext              # noqa: E402
 from equinext.backtest import BacktestConfig, run_backtest  # noqa: E402
-from equinext.metrics import compute_metrics          # noqa: E402
-from baskets.relative_value import RelativeValueBasket, MIN_PE_OBS  # noqa: E402
+from equinext.metrics import compute_metrics              # noqa: E402
+from baskets.relative_value import RelativeValueBasket    # noqa: E402
+from baskets.valuation_momentum import ValuationMomentumBasket  # noqa: E402
+
+BASKETS = {
+    "relative_value": RelativeValueBasket,
+    "valuation_momentum": ValuationMomentumBasket,
+}
+WARMUP_DAYS = 365
 
 
-def main():
+def _parse(argv):
+    name = next((a for a in argv if not a.startswith("--")), "valuation_momentum")
+    rebal = "ME"
+    band = 0.0
+    for i, a in enumerate(argv):
+        if a == "--rebalance" and i + 1 < len(argv):
+            rebal = "QE" if argv[i + 1].upper().startswith("Q") else "ME"
+        if a == "--band" and i + 1 < len(argv):
+            band = float(argv[i + 1])
+    if name not in BASKETS:
+        sys.exit(f"Unknown basket '{name}'. Choose from: {', '.join(BASKETS)}")
+    return name, rebal, band
+
+
+def _fmt(v, name):
+    if v is None:
+        return " " * 10
+    ratio = ("harpe" in name) or ("ortino" in name)
+    return f"{v:10.2f}" if ratio else f"{v:10.2%}"
+
+
+def main(argv):
+    name, rebal, band = _parse(argv)
     ctx = ResearchContext()
 
-    # window: start when BREADTH exists — the date the 30th name clears the
-    # MIN_PE_OBS warm-up (else early rebalances hold a 1-2 stock "portfolio").
     con = sqlite3.connect(str(_REPO / "equinext.db"))
-    pe_min, pe_max = con.execute("SELECT MIN(date), MAX(date) FROM valuation_series").fetchone()
-    if pe_min is None:
-        sys.exit("valuation_series is empty — run scripts/load_nifty50_data.py first.")
-    ready = [r[0] for r in con.execute(
-        """SELECT date FROM (
-               SELECT symbol, date,
-                      ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date) AS rn
-               FROM valuation_series WHERE pe IS NOT NULL
-           ) WHERE rn = ?""", (MIN_PE_OBS,)).fetchall()]
+    vmin, vmax = con.execute("SELECT MIN(date), MAX(date) FROM valuation_series").fetchone()
     con.close()
-    if len(ready) < 30:
-        sys.exit(f"Only {len(ready)} names ever clear {MIN_PE_OBS} P/E obs — load more data.")
-    start = pd.Timestamp(sorted(ready)[29])           # 30th name becomes selectable
+    if vmin is None:
+        sys.exit("valuation_series empty — run scripts/load_nifty50_data.py + load_valuation_full.py first.")
+    start = pd.Timestamp(vmin) + pd.Timedelta(days=WARMUP_DAYS)
     end = ctx.price_matrix().index[-1]
-    print(f"P/E data: {pe_min} .. {pe_max}")
-    print(f"Backtest: {start.date()} .. {end.date()}  "
-          f"(starts when 30 names clear the {MIN_PE_OBS}-obs P/E warm-up)\n")
+    cadence = "quarterly" if rebal == "QE" else "monthly"
+    print(f"Basket: {name}   cadence: {cadence}   no-trade band: {band:.0%}")
+    print(f"Valuation data: {vmin} .. {vmax}")
+    print(f"Backtest: {start.date()} .. {end.date()}  (12mo valuation warm-up)\n")
 
-    cfg = BacktestConfig(start=start.date(), end=end.date())
-    basket = RelativeValueBasket()
+    cfg = BacktestConfig(start=start.date(), end=end.date(), rebalance=rebal, no_trade_band=band)
+    basket = BASKETS[name]()
     res = run_backtest(basket, ctx, cfg)
 
     bench = ctx.benchmark_returns(start, end, index_name="NIFTY50")
@@ -74,22 +102,21 @@ def main():
     ]
     print(f"{'metric':<28} {'basket':>10} {'NIFTY50':>10}")
     print("-" * 50)
-    for name, a, b in rows:
-        fa = f"{a:10.2%}" if isinstance(a, float) and abs(a) < 3 and "harpe" not in name and "ortino" not in name else (f"{a:10.2f}" if a is not None else " " * 10)
-        fb = f"{b:10.2%}" if isinstance(b, float) and abs(b) < 3 and "harpe" not in name and "ortino" not in name else (f"{b:10.2f}" if b is not None else " " * 10)
-        print(f"{name:<28} {fa} {fb}")
+    for nm, a, b in rows:
+        print(f"{nm:<28} {_fmt(a, nm)} {_fmt(b, nm)}")
 
-    print(f"\nAvg monthly turnover (both sides): {res.turnover.mean():.1%}")
+    reb_per_yr = 4 if rebal == "QE" else 12
+    print(f"\nAvg turnover per rebalance (both sides): {res.turnover.mean():.1%}"
+          f"   (~{res.turnover.mean() * reb_per_yr:.0%}/yr)")
     print(f"Rebalances: {len(res.holdings)}")
 
     last_date = max(res.holdings)
-    last = res.holdings[last_date]
-    print(f"\nLatest holdings ({last_date.date() if hasattr(last_date, 'date') else last_date}):")
-    for s, w in sorted(last.items(), key=lambda kv: -kv[1]):
+    print(f"\nLatest holdings ({pd.Timestamp(last_date).date()}):")
+    for s, w in sorted(res.holdings[last_date].items(), key=lambda kv: -kv[1]):
         print(f"  {s:<12} {w:6.2%}")
 
-    # persist for inspection / plotting
-    out = _REPO / "backtest_relative_value.csv"
+    # ---- daily returns file ----
+    out = _REPO / f"backtest_{name}.csv"
     pd.DataFrame({
         "basket": res.returns,
         "basket_after_tax": res.after_tax_returns,
@@ -97,11 +124,25 @@ def main():
     }).to_csv(out)
     print(f"\nDaily returns saved -> {out}")
 
-    # ---- month-by-month analysis file -------------------------------------
-    # One row per calendar month: returns, cumulative ₹100 curves, drawdowns,
-    # plus the rebalance that happened at that month's END (turnover, trades,
-    # avg cheapness of the picked book). NOTE: a month-end rebalance's costs
-    # land in the FIRST day of the NEXT month's return.
+    # ---- month-by-month analysis file ----
+    _write_monthly(_REPO / "exports" / f"backtest_monthly_{name}.csv", res, bench, cfg)
+
+    # ---- holdings + scores into the standard table ----
+    con = sqlite3.connect(str(_REPO / "equinext.db"))
+    con.execute("DELETE FROM basket_holdings WHERE basket = ?", (basket.name,))
+    con.executemany(
+        "INSERT OR REPLACE INTO basket_holdings (basket, as_of, symbol, weight, score) "
+        "VALUES (?,?,?,?,?)",
+        [(basket.name, str(pd.Timestamp(d).date()), s, float(w), res.scores.get(d, {}).get(s))
+         for d, hs in res.holdings.items() for s, w in hs.items()])
+    con.commit(); con.close()
+    print("Holdings + scores written to basket_holdings (equinext.db).")
+
+
+def _write_monthly(out_m: Path, res, bench, cfg) -> None:
+    """One row per calendar month: returns, ₹100 curves, drawdowns, and the
+    rebalance that happened that month (turnover, trades). A rebalance's cost
+    lands in the FIRST day of the NEXT month's return."""
     daily = pd.DataFrame({
         "basket": res.returns,
         "after_tax": res.after_tax_returns,
@@ -109,58 +150,41 @@ def main():
     })
     cum = (1 + daily).cumprod() * 100.0
     dd = cum / cum.cummax() - 1.0
-
-    def _per_month(df, f):
-        return df.groupby(df.index.to_period("M")).apply(f)
+    pm = lambda s, f: s.groupby(s.index.to_period("M")).apply(f)
 
     monthly = pd.DataFrame({
-        "basket_ret": _per_month(daily["basket"], lambda r: (1 + r).prod() - 1),
-        "after_tax_ret": _per_month(daily["after_tax"], lambda r: (1 + r).prod() - 1),
-        "nifty50_ret": _per_month(daily["nifty50"], lambda r: (1 + r).prod() - 1),
+        "basket_ret": pm(daily["basket"], lambda r: (1 + r).prod() - 1),
+        "after_tax_ret": pm(daily["after_tax"], lambda r: (1 + r).prod() - 1),
+        "nifty50_ret": pm(daily["nifty50"], lambda r: (1 + r).prod() - 1),
     })
     monthly["excess_ret"] = monthly["basket_ret"] - monthly["nifty50_ret"]
     monthly["tax_drag"] = monthly["basket_ret"] - monthly["after_tax_ret"]
     for c in ("basket", "after_tax", "nifty50"):
-        monthly[f"cum_{c}_rs100"] = _per_month(cum[c], lambda s: s.iloc[-1])
-    monthly["basket_drawdown"] = _per_month(dd["basket"], lambda s: s.iloc[-1])
-    monthly["nifty50_drawdown"] = _per_month(dd["nifty50"], lambda s: s.iloc[-1])
+        monthly[f"cum_{c}_rs100"] = pm(cum[c], lambda s: s.iloc[-1])
+    monthly["basket_drawdown"] = pm(dd["basket"], lambda s: s.iloc[-1])
+    monthly["nifty50_drawdown"] = pm(dd["nifty50"], lambda s: s.iloc[-1])
 
-    # rebalance facts (keyed by the month the rebalance happened in)
     prev = {}
     for d in sorted(res.holdings):
-        m = pd.Timestamp(d).to_period("M")
-        held = set(res.holdings[d])
-        sc = res.scores.get(d, {})
-        monthly.loc[m, "rebalance_date"] = str(pd.Timestamp(d).date())
-        monthly.loc[m, "n_holdings"] = len(held)
-        monthly.loc[m, "turnover_two_sided"] = float(res.turnover.get(d, float("nan")))
-        monthly.loc[m, "est_cost_pct"] = cfg.cost_bps_per_side / 1e4 * float(res.turnover.get(d, 0.0))
-        monthly.loc[m, "avg_score"] = (sum(sc.values()) / len(sc)) if sc else None
-        monthly.loc[m, "n_bought"] = len(held - set(prev))
-        monthly.loc[m, "n_sold"] = len(set(prev) - held)
-        monthly.loc[m, "bought"] = ";".join(sorted(held - set(prev)))
-        monthly.loc[m, "sold"] = ";".join(sorted(set(prev) - held))
+        mo = pd.Timestamp(d).to_period("M")
+        held, sc = set(res.holdings[d]), res.scores.get(d, {})
+        monthly.loc[mo, "rebalance_date"] = str(pd.Timestamp(d).date())
+        monthly.loc[mo, "n_holdings"] = len(held)
+        monthly.loc[mo, "turnover_two_sided"] = float(res.turnover.get(d, float("nan")))
+        monthly.loc[mo, "est_cost_pct"] = cfg.cost_bps_per_side / 1e4 * float(res.turnover.get(d, 0.0))
+        monthly.loc[mo, "avg_score"] = (sum(sc.values()) / len(sc)) if sc else None
+        monthly.loc[mo, "n_bought"] = len(held - set(prev))
+        monthly.loc[mo, "n_sold"] = len(set(prev) - held)
+        monthly.loc[mo, "bought"] = ";".join(sorted(held - set(prev)))
+        monthly.loc[mo, "sold"] = ";".join(sorted(set(prev) - held))
         prev = held
 
     monthly = monthly.sort_index()
     monthly.index.name = "month"
-    out_m = _REPO / "exports" / "backtest_monthly.csv"
     out_m.parent.mkdir(exist_ok=True)
     monthly.round(6).to_csv(out_m)
     print(f"Monthly analysis file  -> {out_m}  ({len(monthly)} rows)")
 
-    # also record holdings + scores into the standard basket_holdings table
-    con = sqlite3.connect(str(_REPO / "equinext.db"))
-    con.execute("DELETE FROM basket_holdings WHERE basket = ?", (basket.name,))
-    con.executemany(
-        "INSERT OR REPLACE INTO basket_holdings (basket, as_of, symbol, weight, score) "
-        "VALUES (?,?,?,?,?)",
-        [(basket.name, str(pd.Timestamp(d).date()), s, float(w),
-          res.scores.get(d, {}).get(s))
-         for d, hs in res.holdings.items() for s, w in hs.items()])
-    con.commit(); con.close()
-    print("Holdings + scores written to basket_holdings (equinext.db).")
-
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

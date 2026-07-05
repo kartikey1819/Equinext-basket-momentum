@@ -1,8 +1,9 @@
 """
-Turn exports/backtest_monthly.csv into a readable, formatted Excel workbook.
+Turn a backtest monthly CSV into a readable, formatted Excel workbook.
 
-    python scripts/format_monthly_report.py
-    -> exports/backtest_monthly.xlsx
+    python scripts/format_monthly_report.py                     # valuation_momentum
+    python scripts/format_monthly_report.py relative_value
+    -> exports/backtest_monthly_<basket>.xlsx
 
 Sheet 1 "monthly"  — returns as %, ₹100 curves, drawdowns, turnover; freeze
                      header; green/red scale on the excess-return column.
@@ -11,6 +12,7 @@ Sheet 2 "trades"   — per rebalance: names bought / sold (wrapped, wide cols).
 Re-run any time after run_backtest.py refreshes the CSV.
 """
 from __future__ import annotations
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -19,8 +21,9 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 _REPO = Path(__file__).resolve().parents[1]
-SRC = _REPO / "exports" / "backtest_monthly.csv"
-OUT = _REPO / "exports" / "backtest_monthly.xlsx"
+_BASKET = next((a for a in sys.argv[1:] if not a.startswith("--")), "valuation_momentum")
+SRC = _REPO / "exports" / f"backtest_monthly_{_BASKET}.csv"
+OUT = _REPO / "exports" / f"backtest_monthly_{_BASKET}.xlsx"
 
 PCT = ["basket_ret", "after_tax_ret", "nifty50_ret", "excess_ret", "tax_drag",
        "basket_drawdown", "nifty50_drawdown", "turnover_two_sided", "est_cost_pct"]
