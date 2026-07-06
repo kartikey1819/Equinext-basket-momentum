@@ -41,6 +41,7 @@ MIN_VAL_OBS = 60          # valuation rows before froth/decomp gates apply
 
 class ValuationMomentumBasket(Basket):
     name = "valuation_momentum"
+    USE_GATES = True          # False -> momentum-only ablation (see MomentumOnlyBasket)
 
     def select(self, as_of, ctx) -> Selection:
         as_of = pd.Timestamp(as_of)
@@ -93,10 +94,13 @@ class ValuationMomentumBasket(Basket):
         df["momentum"] = composite(df, ["mom", "dh", "vt"], [True, True, True])
 
         # Steps 2 & 4: GATES. froth==nan means 'no valuation history yet' -> don't drop.
-        gated = df[
-            ((df["froth"].isna()) | (df["froth"] <= FROTH_MAX)) & (df["earnings_backed"])
-        ]
-        pool = gated if len(gated) >= N_MIN else df.sort_values("momentum", ascending=False)
+        if self.USE_GATES:
+            gated = df[
+                ((df["froth"].isna()) | (df["froth"] <= FROTH_MAX)) & (df["earnings_backed"])
+            ]
+            pool = gated if len(gated) >= N_MIN else df.sort_values("momentum", ascending=False)
+        else:
+            pool = df                                       # ablation: momentum-only, no gates
 
         top = pool.sort_values("momentum", ascending=False).head(N_HOLD)
         inv = 1.0 / top["vol"]                                   # inverse-vol weights
@@ -106,6 +110,14 @@ class ValuationMomentumBasket(Basket):
         sel = Selection(as_of=as_of.date(), weights=weights, scores=scores)
         sel.validate()
         return sel
+
+
+class MomentumOnlyBasket(ValuationMomentumBasket):
+    """Ablation twin — identical momentum ranking + inverse-vol weighting, but with
+    the valuation & earnings-backing gates DISABLED. Run side-by-side with the
+    gated basket over the same window to measure what the gates actually add."""
+    name = "momentum_only"
+    USE_GATES = False
 
 
 def _growth(eps: pd.Series, end, months: int = 12) -> float:

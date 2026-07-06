@@ -35,11 +35,12 @@ from equinext.context import ResearchContext              # noqa: E402
 from equinext.backtest import BacktestConfig, run_backtest  # noqa: E402
 from equinext.metrics import compute_metrics              # noqa: E402
 from baskets.relative_value import RelativeValueBasket    # noqa: E402
-from baskets.valuation_momentum import ValuationMomentumBasket  # noqa: E402
+from baskets.valuation_momentum import ValuationMomentumBasket, MomentumOnlyBasket  # noqa: E402
 
 BASKETS = {
     "relative_value": RelativeValueBasket,
     "valuation_momentum": ValuationMomentumBasket,
+    "momentum_only": MomentumOnlyBasket,
 }
 WARMUP_DAYS = 365
 
@@ -48,14 +49,17 @@ def _parse(argv):
     name = next((a for a in argv if not a.startswith("--")), "valuation_momentum")
     rebal = "ME"
     band = 0.0
+    start_override = None
     for i, a in enumerate(argv):
         if a == "--rebalance" and i + 1 < len(argv):
             rebal = "QE" if argv[i + 1].upper().startswith("Q") else "ME"
         if a == "--band" and i + 1 < len(argv):
             band = float(argv[i + 1])
+        if a == "--start" and i + 1 < len(argv):
+            start_override = argv[i + 1]   # YYYY-MM-DD; overrides the auto warm-up window
     if name not in BASKETS:
         sys.exit(f"Unknown basket '{name}'. Choose from: {', '.join(BASKETS)}")
-    return name, rebal, band
+    return name, rebal, band, start_override
 
 
 def _fmt(v, name):
@@ -66,7 +70,7 @@ def _fmt(v, name):
 
 
 def main(argv):
-    name, rebal, band = _parse(argv)
+    name, rebal, band, start_override = _parse(argv)
     ctx = ResearchContext()
 
     con = sqlite3.connect(str(_REPO / "equinext.db"))
@@ -74,12 +78,20 @@ def main(argv):
     con.close()
     if vmin is None:
         sys.exit("valuation_series empty — run scripts/load_nifty50_data.py + load_valuation_full.py first.")
-    start = pd.Timestamp(vmin) + pd.Timedelta(days=WARMUP_DAYS)
+    if start_override:
+        start = pd.Timestamp(start_override)
+    else:
+        start = pd.Timestamp(vmin) + pd.Timedelta(days=WARMUP_DAYS)
     end = ctx.price_matrix().index[-1]
     cadence = "quarterly" if rebal == "QE" else "monthly"
     print(f"Basket: {name}   cadence: {cadence}   no-trade band: {band:.0%}")
     print(f"Valuation data: {vmin} .. {vmax}")
-    print(f"Backtest: {start.date()} .. {end.date()}  (12mo valuation warm-up)\n")
+    print(f"Backtest: {start.date()} .. {end.date()}"
+          f"{'  (custom start)' if start_override else '  (12mo valuation warm-up)'}")
+    if pd.Timestamp(start) < pd.Timestamp(vmin):
+        print(f"NOTE: before {vmin} there is no valuation data -> froth/earnings gates "
+              f"are INACTIVE; the basket runs momentum-only in that stretch.")
+    print()
 
     cfg = BacktestConfig(start=start.date(), end=end.date(), rebalance=rebal, no_trade_band=band)
     basket = BASKETS[name]()

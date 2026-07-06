@@ -47,39 +47,47 @@ def main():
     trades = df[["month", "rebalance_date", "n_bought", "n_sold", "bought", "sold"]].copy()
     monthly = df[[c for c in NICE]].copy()
 
-    with pd.ExcelWriter(OUT, engine="openpyxl") as xw:
-        monthly.rename(columns={k: v[0] for k, v in NICE.items()}).to_excel(
-            xw, sheet_name="monthly", index=False)
-        trades.to_excel(xw, sheet_name="trades", index=False)
+    def _write(path):
+        with pd.ExcelWriter(path, engine="openpyxl") as xw:
+            monthly.rename(columns={k: v[0] for k, v in NICE.items()}).to_excel(
+                xw, sheet_name="monthly", index=False)
+            trades.to_excel(xw, sheet_name="trades", index=False)
 
-        ws = xw.sheets["monthly"]
-        ws.freeze_panes = "A2"
-        for j, col in enumerate(monthly.columns, start=1):
-            letter = get_column_letter(j)
-            ws.column_dimensions[letter].width = NICE[col][1] + 2
-            ws.cell(row=1, column=j).font = Font(bold=True)
-            fmt = "0.00%" if col in PCT else ("#,##0.00" if col in RS or col == "avg_score" else None)
-            if fmt:
-                for i in range(2, len(monthly) + 2):
-                    ws.cell(row=i, column=j).number_format = fmt
-        # red -> white -> green scale on the Excess % column
-        ex = get_column_letter(monthly.columns.get_loc("excess_ret") + 1)
-        ws.conditional_formatting.add(
-            f"{ex}2:{ex}{len(monthly) + 1}",
-            ColorScaleRule(start_type="num", start_value=-0.03, start_color="F8696B",
-                           mid_type="num", mid_value=0, mid_color="FFFFFF",
-                           end_type="num", end_value=0.03, end_color="63BE7B"))
+            ws = xw.sheets["monthly"]
+            ws.freeze_panes = "A2"
+            for j, col in enumerate(monthly.columns, start=1):
+                letter = get_column_letter(j)
+                ws.column_dimensions[letter].width = NICE[col][1] + 2
+                ws.cell(row=1, column=j).font = Font(bold=True)
+                fmt = "0.00%" if col in PCT else ("#,##0.00" if col in RS or col == "avg_score" else None)
+                if fmt:
+                    for i in range(2, len(monthly) + 2):
+                        ws.cell(row=i, column=j).number_format = fmt
+            ex = get_column_letter(monthly.columns.get_loc("excess_ret") + 1)
+            ws.conditional_formatting.add(
+                f"{ex}2:{ex}{len(monthly) + 1}",
+                ColorScaleRule(start_type="num", start_value=-0.03, start_color="F8696B",
+                               mid_type="num", mid_value=0, mid_color="FFFFFF",
+                               end_type="num", end_value=0.03, end_color="63BE7B"))
 
-        wt = xw.sheets["trades"]
-        wt.freeze_panes = "A2"
-        for j, w in enumerate([9, 13, 6, 6, 70, 70], start=1):
-            wt.column_dimensions[get_column_letter(j)].width = w
-            wt.cell(row=1, column=j).font = Font(bold=True)
-        for i in range(2, len(trades) + 2):
-            for j in (5, 6):
-                wt.cell(row=i, column=j).alignment = Alignment(wrap_text=True, vertical="top")
+            wt = xw.sheets["trades"]
+            wt.freeze_panes = "A2"
+            for j, w in enumerate([9, 13, 6, 6, 70, 70], start=1):
+                wt.column_dimensions[get_column_letter(j)].width = w
+                wt.cell(row=1, column=j).font = Font(bold=True)
+            for i in range(2, len(trades) + 2):
+                for j in (5, 6):
+                    wt.cell(row=i, column=j).alignment = Alignment(wrap_text=True, vertical="top")
 
-    print(f"Wrote {OUT}")
+    try:
+        _write(OUT)
+        print(f"Wrote {OUT}")
+    except PermissionError:
+        alt = OUT.with_stem(OUT.stem + "_refreshed")
+        _write(alt)
+        print(f"⚠ {OUT.name} is OPEN in Excel — could not overwrite it.\n"
+              f"  Wrote a fresh copy -> {alt.name}\n"
+              f"  Close {OUT.name} in Excel, delete the '~$...' lock file, and re-run to update the original.")
 
 
 if __name__ == "__main__":
