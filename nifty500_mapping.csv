@@ -9,8 +9,6 @@ BAJFINANCE,Bajaj Finance Limited,Financial Services
 BAJAJFINSV,Bajaj Finserv Ltd.,Financial Services
 BEL,Bharat Electronics Limited,Industrials
 BHARTIARTL,Bharti Airtel Limited,Communication Services
-BPCL,Bharat Petroleum Corporation Limited,Energy
-BRITANNIA,Britannia Industries Limited,Consumer Defensive
 CIPLA,Cipla Limited,Healthcare
 COALINDIA,Coal India Limited,Energy
 DRREDDY,Dr. Reddy's Laboratories Limited,Healthcare
@@ -19,11 +17,9 @@ GRASIM,Grasim Industries Limited,Basic Materials
 HCLTECH,HCL Technologies Limited,Technology
 HDFCBANK,HDFC Bank Limited,Financial Services
 HDFCLIFE,HDFC Life Insurance Company Limited,Financial Services
-HEROMOTOCO,Hero MotoCorp Limited,Consumer Cyclical
 HINDALCO,Hindalco Industries Limited,Basic Materials
 HINDUNILVR,Hindustan Unilever Limited,Consumer Defensive
 ICICIBANK,ICICI Bank Limited,Financial Services
-INDUSINDBK,IndusInd Bank Limited,Financial Services
 INFY,Infosys Limited,Technology
 ITC,ITC Limited,Consumer Defensive
 JSWSTEEL,JSW Steel Limited,Basic Materials
@@ -48,3 +44,8 @@ TITAN,Titan Company Limited,Consumer Cyclical
 TRENT,Trent Limited,Consumer Cyclical
 ULTRACEMCO,UltraTech Cement Limited,Basic Materials
 WIPRO,Wipro Limited,Technology
+ETERNAL,Eternal Limited,Consumer Cyclical
+INDIGO,InterGlobe Aviation Limited,Industrials
+JIOFIN,Jio Financial Services Limited,Financial Services
+MAXHEALTH,Max Healthcare Institute Limited,Healthcare
+TMPV,Tata Motors Passenger Vehicles Limited,Consumer Cyclical

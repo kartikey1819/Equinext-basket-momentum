@@ -54,19 +54,17 @@ REPORT_LAG_DAYS = 45
 NI_ROWS = ("Net Income", "Net Income Common Stockholders",
            "Net Income From Continuing Operation Net Minority Interest")
 
-# Nifty 50, bare NSE symbols (DB keys) -> Yahoo tickers are symbol + ".NS".
-# TATAMOTORS excluded: ticker delisted on Yahoo after the 2025 CV/PV demerger.
+# Official NSE Nifty 50 constituents (verified list). Bare NSE symbols (DB keys)
+# -> Yahoo tickers are symbol + ".NS". TMPV carries the old Tata Motors history;
+# ETERNAL is ex-Zomato. JIOFIN/MAXHEALTH/ETERNAL are recent listings (partial history).
 NIFTY50 = [
-    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL",
-    "BPCL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
-    "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
-    "INFY", "ITC", "JSWSTEEL", "KOTAKBANK", "LT",
-    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
-    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
-    "SUNPHARMA", "TATACONSUM", "TATASTEEL", "TCS",
-    "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO",
+    "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "CIPLA", "COALINDIA", "DRREDDY",
+    "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO",
+    "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY", "ITC", "JIOFIN", "JSWSTEEL",
+    "KOTAKBANK", "LT", "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC",
+    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM",
+    "TATASTEEL", "TCS", "TECHM", "TITAN", "TMPV", "TRENT", "ULTRACEMCO", "WIPRO",
 ]
 BENCHMARKS = {"NIFTY50": "^NSEI", "NIFTY500": "^CRSLDX"}
 

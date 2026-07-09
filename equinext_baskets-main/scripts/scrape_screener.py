@@ -49,14 +49,14 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) personal-research
 DELAY_S = 2.5
 LAG_DAYS = 75          # fiscal-year-end -> results announced (~mid-June for Mar y/e)
 
-NIFTY50 = [
+NIFTY50 = [   # official NSE Nifty 50 constituents (verified list)
     "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO",
-    "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "BPCL", "BRITANNIA", "CIPLA",
-    "COALINDIA", "DRREDDY", "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY", "ITC",
-    "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+    "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "CIPLA", "COALINDIA", "DRREDDY",
+    "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO",
+    "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY", "ITC", "JIOFIN", "JSWSTEEL",
+    "KOTAKBANK", "LT", "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC",
     "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM",
-    "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+    "TATASTEEL", "TCS", "TECHM", "TITAN", "TMPV", "TRENT", "ULTRACEMCO", "WIPRO",
 ]
 
 
@@ -130,9 +130,13 @@ def parse_annual(html: str) -> dict | None:
     if net is None or eps is None or eps.empty:
         return None
 
-    # shares(yr) = NetProfit/EPS; fill sparse/loss years by nearest (count is stable)
-    valid = eps.abs() > 1e-9
-    shares = (net[valid] / eps[valid]).reindex(net.index).ffill().bfill()
+    # shares(yr) = NetProfit/EPS; fill sparse/loss years by nearest (count is stable).
+    # net & eps can cover different years (new/ex-loss names) -> align on the overlap first.
+    pair = pd.concat([net, eps], axis=1, keys=["net", "eps"]).dropna()
+    pair = pair[pair["eps"].abs() > 1e-9]
+    if pair.empty:
+        return None
+    shares = (pair["net"] / pair["eps"]).reindex(net.index).ffill().bfill()
     shares = shares[shares > 0]
     if shares.empty:
         return None

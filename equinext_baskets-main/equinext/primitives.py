@@ -52,11 +52,14 @@ _EXPENSIVE_WHEN_LOW = ("fcf_yield",)               # higher yield = cheaper (inv
 
 
 def valuation_froth_percentile(vdf: pd.DataFrame, end, years: int = 5,
-                               min_obs: int = 60) -> float:
+                               min_obs: int = 60, cols=None) -> float:
     """Composite own-history 'expensiveness' percentile (0-1) across whatever
     multiples are populated for this name. 0 = cheapest vs its own history on
     every available multiple; 1 = richest. Financials contribute pe+pb only;
     fcf_yield is inverted (high yield = cheap). nan if nothing usable.
+
+    `cols` optionally restricts which multiples count (e.g. ("pe",) for a
+    P/E-only gate) — used for ablation tests. None = use all available.
 
     This is the froth GATE for valuation-momentum: momentum ranks, this filters
     out names trading rich vs their own past.
@@ -66,6 +69,8 @@ def valuation_froth_percentile(vdf: pd.DataFrame, end, years: int = 5,
     s = s.set_index("date").sort_index()
     pctiles = []
     for col in _EXPENSIVE_WHEN_HIGH:
+        if cols is not None and col not in cols:
+            continue
         if col in s.columns:
             ser = pd.to_numeric(s[col], errors="coerce").dropna()
             if len(ser) >= min_obs:
@@ -73,6 +78,8 @@ def valuation_froth_percentile(vdf: pd.DataFrame, end, years: int = 5,
                 if not np.isnan(p):
                     pctiles.append(p)
     for col in _EXPENSIVE_WHEN_LOW:
+        if cols is not None and col not in cols:
+            continue
         if col in s.columns:
             ser = pd.to_numeric(s[col], errors="coerce").dropna()
             if len(ser) >= min_obs:

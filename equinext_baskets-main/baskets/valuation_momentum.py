@@ -42,6 +42,10 @@ MIN_VAL_OBS = 60          # valuation rows before froth/decomp gates apply
 class ValuationMomentumBasket(Basket):
     name = "valuation_momentum"
     USE_GATES = True          # False -> momentum-only ablation (see MomentumOnlyBasket)
+    FROTH_MULTIPLES = None     # None = all available (pe/pb/ev_ebitda/fcf); or e.g. ("pe",)
+    GROWTH_EXEMPT = None       # None = blunt froth gate. e.g. 0.20 -> a frothy stock is
+                               # EXCUSED if its earnings grow >= 20%/yr (growth-adjusted gate)
+    FROTH_MAX = FROTH_MAX      # drop names richer than this own-history percentile (sweepable)
 
     def select(self, as_of, ctx) -> Selection:
         as_of = pd.Timestamp(as_of)
@@ -65,17 +69,18 @@ class ValuationMomentumBasket(Basket):
                 continue
 
             # --- valuation froth + earnings-backing (only if we have history) ---
-            froth, earnings_backed = np.nan, True
+            froth, earnings_backed, earn_growth = np.nan, True, np.nan
             try:
                 vdf = ctx.valuation_series(sym, end=as_of, lookback_years=7)
             except NotImplementedError:
                 vdf = None
             if vdf is not None and len(vdf) >= MIN_VAL_OBS:
-                froth = valuation_froth_percentile(vdf, as_of)
+                froth = valuation_froth_percentile(vdf, as_of, cols=self.FROTH_MULTIPLES)
                 eps = pd.to_numeric(
                     vdf.assign(date=pd.to_datetime(vdf["date"])).set_index("date")["eps_ttm"],
                     errors="coerce").dropna() if "eps_ttm" in vdf.columns else pd.Series(dtype=float)
                 g = _growth(eps, as_of, months=12)
+                earn_growth = g                       # trailing 12m earnings growth (for growth-adj gate)
                 pr = return_over(close, as_of, 12)
                 # need both > -100% for the log decomposition to be defined
                 if np.isfinite(g) and np.isfinite(pr) and g > -0.99 and pr > -0.99:
@@ -83,8 +88,8 @@ class ValuationMomentumBasket(Basket):
                     if np.isfinite(e_con) and np.isfinite(m_con):
                         earnings_backed = (e_con > 0) and (e_con >= m_con)  # earnings >= froth
 
-            rows.append({"symbol": sym, "mom": mom, "dh": dh, "vt": vt,
-                         "vol": rv, "froth": froth, "earnings_backed": earnings_backed})
+            rows.append({"symbol": sym, "mom": mom, "dh": dh, "vt": vt, "vol": rv,
+                         "froth": froth, "earnings_backed": earnings_backed, "earn_growth": earn_growth})
 
         df = pd.DataFrame(rows).dropna(subset=["mom", "dh", "vt", "vol"])
         if df.empty:
@@ -95,9 +100,13 @@ class ValuationMomentumBasket(Basket):
 
         # Steps 2 & 4: GATES. froth==nan means 'no valuation history yet' -> don't drop.
         if self.USE_GATES:
-            gated = df[
-                ((df["froth"].isna()) | (df["froth"] <= FROTH_MAX)) & (df["earnings_backed"])
-            ]
+            froth_ok = df["froth"].isna() | (df["froth"] <= self.FROTH_MAX)
+            if self.GROWTH_EXEMPT is not None:
+                # growth-adjusted: excuse a frothy stock if its earnings are genuinely
+                # growing fast enough to justify the premium (real re-rater, not hype)
+                exempt = (df["froth"] > self.FROTH_MAX) & (df["earn_growth"] >= self.GROWTH_EXEMPT)
+                froth_ok = froth_ok | exempt
+            gated = df[froth_ok & df["earnings_backed"]]
             pool = gated if len(gated) >= N_MIN else df.sort_values("momentum", ascending=False)
         else:
             pool = df                                       # ablation: momentum-only, no gates
@@ -118,6 +127,22 @@ class MomentumOnlyBasket(ValuationMomentumBasket):
     gated basket over the same window to measure what the gates actually add."""
     name = "momentum_only"
     USE_GATES = False
+
+
+class ValuationMomentumPEOnly(ValuationMomentumBasket):
+    """Ablation — same strategy but the froth gate uses P/E ONLY (no pb/ev/fcf).
+    Race against the full four-multiple basket to see if the extra measures earn
+    their place or whether P/E alone suffices."""
+    name = "vm_pe_only"
+    FROTH_MULTIPLES = ("pe",)
+
+
+class ValuationMomentumGrowthAdj(ValuationMomentumBasket):
+    """Growth-adjusted froth gate — a frothy stock (P/E above its 0.80 own-history
+    percentile) is EXCUSED and kept if its earnings are genuinely growing fast
+    (>= 20%/yr), so real re-raters aren't wrongly dropped for legitimate re-rating."""
+    name = "vm_growth_adj"
+    GROWTH_EXEMPT = 0.20
 
 
 def _growth(eps: pd.Series, end, months: int = 12) -> float:

@@ -35,12 +35,16 @@ from equinext.context import ResearchContext              # noqa: E402
 from equinext.backtest import BacktestConfig, run_backtest  # noqa: E402
 from equinext.metrics import compute_metrics              # noqa: E402
 from baskets.relative_value import RelativeValueBasket    # noqa: E402
-from baskets.valuation_momentum import ValuationMomentumBasket, MomentumOnlyBasket  # noqa: E402
+from baskets.valuation_momentum import (  # noqa: E402
+    ValuationMomentumBasket, MomentumOnlyBasket, ValuationMomentumPEOnly,
+    ValuationMomentumGrowthAdj)
 
 BASKETS = {
     "relative_value": RelativeValueBasket,
     "valuation_momentum": ValuationMomentumBasket,
     "momentum_only": MomentumOnlyBasket,
+    "vm_pe_only": ValuationMomentumPEOnly,
+    "vm_growth_adj": ValuationMomentumGrowthAdj,
 }
 WARMUP_DAYS = 365
 
