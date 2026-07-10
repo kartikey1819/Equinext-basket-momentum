@@ -26,8 +26,8 @@ from flask import Flask, jsonify, render_template, abort
 _REPO = Path(__file__).resolve().parents[1]
 SOURCE_DB = _REPO.parent / "nifty500_hrp.db"
 PROJECT_DB = _REPO / "equinext.db"
-BACKTEST_CSV = _REPO / "backtest_valuation_momentum.csv"
-BASKET = "valuation_momentum"
+BASKET = "vm_pe_only"          # the final basket: P/E froth gate + earnings gate + momentum
+BACKTEST_CSV = _REPO / f"backtest_{BASKET}.csv"
 
 app = Flask(__name__)
 
@@ -241,6 +241,7 @@ def basket():
         last, prev = (g.iloc[-1], g.iloc[-2]) if len(g) >= 2 else (None, None)
         info = secs.loc[sym] if sym in secs.index else None
         rows.append({"symbol": sym, "name": (info["name"] if info is not None and pd.notna(info["name"]) else sym),
+                     "sector": (info["sector"] if info is not None and pd.notna(info["sector"]) else "—"),
                      "weight": _clean(h["weight"] * 100), "score": _clean(h["score"]),
                      "price": _clean(last), "change_pct": _clean((last / prev - 1) * 100 if last else None)})
     rows.sort(key=lambda r: -(r["weight"] or 0))
@@ -261,6 +262,79 @@ def basket():
                    "max_dd": _clean(dd * 100), "final": _clean(cb.iloc[-1]),
                    "final_nifty": _clean(cn.iloc[-1]), "years": _clean(yrs)}
     return jsonify({"as_of": held["as_of"], "holdings": rows, "curve": curve, "metrics": metrics})
+
+
+@app.route("/api/rebalances")
+def rebalances():
+    """The basket's trade history — what was bought/sold at each quarterly rebalance."""
+    con = sqlite3.connect(str(PROJECT_DB))
+    df = pd.read_sql("SELECT as_of, symbol, weight FROM basket_holdings WHERE basket=? ORDER BY as_of",
+                     con, params=(BASKET,))
+    con.close()
+    if df.empty:
+        return jsonify({"rebalances": []})
+    out, prev = [], {}
+    for d in sorted(df["as_of"].unique()):
+        cur = dict(zip(df[df.as_of == d].symbol, df[df.as_of == d].weight))
+        cs, ps = set(cur), set(prev)
+        turnover = sum(abs(cur.get(s, 0) - prev.get(s, 0)) for s in cs | ps) * 100
+        out.append({"date": d, "bought": sorted(cs - ps), "sold": sorted(ps - cs),
+                    "kept": len(cs & ps), "n": len(cur), "turnover": round(turnover, 1)})
+        prev = cur
+    out.reverse()   # most recent first
+    return jsonify({"rebalances": out})
+
+
+@app.route("/api/strategy")
+def strategy():
+    """The basket's construction criteria — the 'why', with real thresholds."""
+    n_universe = len(_securities())
+    return jsonify({
+        "name": "Equinext Valuation-Momentum Basket",
+        "tagline": "Own the strongest Nifty 50 stocks — but only the ones that aren't overpriced and whose rise is backed by real earnings.",
+        "n_universe": n_universe,
+        "n_hold": 15,
+        "rebalance": "Quarterly",
+        "weighting": "Inverse-volatility (calmer stocks get more)",
+        "steps": [
+            {"n": 1, "key": "universe", "title": "Universe Filter",
+             "icon": "filter",
+             "why": "Only large, liquid, established companies you can actually trade without moving the price.",
+             "criteria": [f"{n_universe} official Nifty 50 constituents",
+                          "Median traded value ≥ ₹5 cr/day (63-day)",
+                          "Free-float market cap ≥ ₹100 cr",
+                          "At least ~1 year of price history"]},
+            {"n": 2, "key": "valuation", "title": "Valuation Gate (P/E)",
+             "icon": "shield",
+             "why": "Don't chase froth. A stock trading at its own most-expensive extreme falls hardest when sentiment turns.",
+             "criteria": ["Rank today's P/E within the stock's own 5-year history",
+                          "Drop any stock above its 80th percentile (its own expensive extreme)",
+                          "This filters out the frothy; it does not rank"]},
+            {"n": 3, "key": "momentum", "title": "Momentum Score",
+             "icon": "trend",
+             "why": "Ride the strongest, most broadly-confirmed uptrends — stocks going up tend to keep going up.",
+             "criteria": ["12-month return (skipping the last month)",
+                          "Distance from the 52-week high",
+                          "Volume trend (rising participation)",
+                          "Each z-scored vs peers, then averaged into one score"]},
+            {"n": 4, "key": "earnings", "title": "Earnings-Backed Gate",
+             "icon": "check",
+             "why": "Keep only rises driven by real profit growth, not hype. Story stocks collapse in downturns.",
+             "criteria": ["Split the 12-month rise into earnings vs multiple (hype)",
+                          "Keep only if earnings did at least half the work",
+                          "Drops pure multiple-expansion names"]},
+        ],
+        "selection": {
+            "title": "How the 15 stocks are chosen & weighted",
+            "points": [
+                "Every quarter, all 50 stocks pass through the funnel above.",
+                "The valuation & earnings gates remove the risky names.",
+                "Survivors are ranked by momentum score — the top 15 are held.",
+                "Each is weighted by inverse-volatility: steadier stocks get a bigger slice, so no single wild stock dominates the risk.",
+                "No stock is picked on one raw number — it's the combined, peer-relative score that decides.",
+            ],
+        },
+    })
 
 
 if __name__ == "__main__":

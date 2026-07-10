@@ -3,32 +3,34 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Equinext — Nifty 50 Research</title>
+  <title>Equinext — Nifty 50 Baskets & Research</title>
   <link rel="stylesheet" href="/static/style.css">
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand"><span class="dot"></span> Equinext</div>
-    <input id="search" class="search" placeholder="Search stock…" autocomplete="off">
-    <nav class="tabs">
-      <button class="navtab active" data-view="stocks">Stocks</button>
-      <button class="navtab" data-view="basket">Basket</button>
-    </nav>
-    <div class="asof" id="asof"></div>
-  </header>
+  <nav class="nav">
+    <div class="logo"><span class="mark">E</span> Equinext</div>
+    <div class="navtabs">
+      <button class="navtab active" data-view="basket">Basket</button>
+      <button class="navtab" data-view="stocks">Stocks</button>
+    </div>
+    <div class="search"><input id="search" placeholder="Search a stock…" autocomplete="off"></div>
+  </nav>
 
-  <!-- STOCKS VIEW -->
-  <div id="stocks-view" class="view">
-    <aside class="sidebar" id="stocklist"></aside>
-    <main class="detail" id="detail">
-      <div class="empty">Select a stock…</div>
-    </main>
+  <!-- BASKET LANDING -->
+  <div id="basket-view" class="view">
+    <div class="wrap" id="basket"><div class="loading">Loading basket…</div></div>
   </div>
 
-  <!-- BASKET VIEW -->
-  <div id="basket-view" class="view" hidden>
-    <div class="basket-wrap" id="basket"></div>
+  <!-- STOCKS -->
+  <div id="stocks-view" class="view" hidden>
+    <div class="stocks">
+      <aside class="sidebar">
+        <div class="srch2"><input id="search2" placeholder="Search…" autocomplete="off"></div>
+        <div id="stocklist"></div>
+      </aside>
+      <main class="detail" id="detail"><div class="empty">Select a stock to see its chart, technicals & fundamentals.</div></main>
+    </div>
   </div>
 
   <script src="/static/app.js"></script>
