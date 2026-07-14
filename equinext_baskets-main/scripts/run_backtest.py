@@ -37,7 +37,7 @@ from equinext.metrics import compute_metrics              # noqa: E402
 from baskets.relative_value import RelativeValueBasket    # noqa: E402
 from baskets.valuation_momentum import (  # noqa: E402
     ValuationMomentumBasket, MomentumOnlyBasket, ValuationMomentumPEOnly,
-    ValuationMomentumGrowthAdj)
+    ValuationMomentumGrowthAdj, ValuationMomentumPIT, VM500Standard, VM500PIT)
 
 BASKETS = {
     "relative_value": RelativeValueBasket,
@@ -45,6 +45,9 @@ BASKETS = {
     "momentum_only": MomentumOnlyBasket,
     "vm_pe_only": ValuationMomentumPEOnly,
     "vm_growth_adj": ValuationMomentumGrowthAdj,
+    "vm_pit": ValuationMomentumPIT,
+    "vm500": VM500Standard,
+    "vm500_pit": VM500PIT,
 }
 WARMUP_DAYS = 365
 
@@ -56,7 +59,8 @@ def _parse(argv):
     start_override = None
     for i, a in enumerate(argv):
         if a == "--rebalance" and i + 1 < len(argv):
-            rebal = "QE" if argv[i + 1].upper().startswith("Q") else "ME"
+            v = argv[i + 1].upper()
+            rebal = "QE" if v.startswith("Q") else ("2M" if (v.startswith("2") or v.startswith("B")) else "ME")
         if a == "--band" and i + 1 < len(argv):
             band = float(argv[i + 1])
         if a == "--start" and i + 1 < len(argv):
@@ -87,8 +91,11 @@ def main(argv):
     else:
         start = pd.Timestamp(vmin) + pd.Timedelta(days=WARMUP_DAYS)
     end = ctx.price_matrix().index[-1]
-    cadence = "quarterly" if rebal == "QE" else "monthly"
-    print(f"Basket: {name}   cadence: {cadence}   no-trade band: {band:.0%}")
+    cadence = {"QE": "quarterly", "ME": "monthly", "2M": "bi-monthly"}[rebal]
+    # store outputs under a cadence-tagged key so cadences don't overwrite each
+    # other. Quarterly keeps the bare name (back-compat with the existing runs).
+    store_key = name + {"QE": "", "ME": "_M", "2M": "_2M"}[rebal]
+    print(f"Basket: {name}   cadence: {cadence}   store key: {store_key}   no-trade band: {band:.0%}")
     print(f"Valuation data: {vmin} .. {vmax}")
     print(f"Backtest: {start.date()} .. {end.date()}"
           f"{'  (custom start)' if start_override else '  (12mo valuation warm-up)'}")
@@ -101,7 +108,8 @@ def main(argv):
     basket = BASKETS[name]()
     res = run_backtest(basket, ctx, cfg)
 
-    bench = ctx.benchmark_returns(start, end, index_name="NIFTY50")
+    bench_index = "NIFTY500" if name.startswith("vm500") else "NIFTY50"
+    bench = ctx.benchmark_returns(start, end, index_name=bench_index)
     m = compute_metrics(res.returns, bench, after_tax=res.after_tax_returns)
     mb = compute_metrics(bench, bench)
 
@@ -121,7 +129,7 @@ def main(argv):
     for nm, a, b in rows:
         print(f"{nm:<28} {_fmt(a, nm)} {_fmt(b, nm)}")
 
-    reb_per_yr = 4 if rebal == "QE" else 12
+    reb_per_yr = {"QE": 4, "ME": 12, "2M": 6}[rebal]
     print(f"\nAvg turnover per rebalance (both sides): {res.turnover.mean():.1%}"
           f"   (~{res.turnover.mean() * reb_per_yr:.0%}/yr)")
     print(f"Rebalances: {len(res.holdings)}")
@@ -132,7 +140,7 @@ def main(argv):
         print(f"  {s:<12} {w:6.2%}")
 
     # ---- daily returns file ----
-    out = _REPO / f"backtest_{name}.csv"
+    out = _REPO / f"backtest_{store_key}.csv"
     pd.DataFrame({
         "basket": res.returns,
         "basket_after_tax": res.after_tax_returns,
@@ -141,18 +149,18 @@ def main(argv):
     print(f"\nDaily returns saved -> {out}")
 
     # ---- month-by-month analysis file ----
-    _write_monthly(_REPO / "exports" / f"backtest_monthly_{name}.csv", res, bench, cfg)
+    _write_monthly(_REPO / "exports" / f"backtest_monthly_{store_key}.csv", res, bench, cfg)
 
-    # ---- holdings + scores into the standard table ----
+    # ---- holdings + scores into the standard table (keyed by store_key) ----
     con = sqlite3.connect(str(_REPO / "equinext.db"))
-    con.execute("DELETE FROM basket_holdings WHERE basket = ?", (basket.name,))
+    con.execute("DELETE FROM basket_holdings WHERE basket = ?", (store_key,))
     con.executemany(
         "INSERT OR REPLACE INTO basket_holdings (basket, as_of, symbol, weight, score) "
         "VALUES (?,?,?,?,?)",
-        [(basket.name, str(pd.Timestamp(d).date()), s, float(w), res.scores.get(d, {}).get(s))
+        [(store_key, str(pd.Timestamp(d).date()), s, float(w), res.scores.get(d, {}).get(s))
          for d, hs in res.holdings.items() for s, w in hs.items()])
     con.commit(); con.close()
-    print("Holdings + scores written to basket_holdings (equinext.db).")
+    print(f"Holdings + scores written to basket_holdings as '{store_key}'.")
 
 
 def _write_monthly(out_m: Path, res, bench, cfg) -> None:

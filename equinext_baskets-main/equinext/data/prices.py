@@ -68,23 +68,33 @@ def trading_days() -> pd.DatetimeIndex:
     return price_matrix().index
 
 
+_OHLCV_BY_SYM: dict | None = None       # per-symbol OHLCV, loaded once (big backtests hit this a lot)
+
+
+def _ohlcv_by_sym() -> dict:
+    global _OHLCV_BY_SYM
+    if _OHLCV_BY_SYM is None:
+        con = _source_conn()
+        try:
+            df = pd.read_sql("SELECT date, symbol, open, high, low, close, volume FROM ohlcv", con)
+        finally:
+            con.close()
+        df["date"] = _parse_dates(df["date"])
+        df = df.drop_duplicates(subset=["date", "symbol"], keep="last").sort_values(["symbol", "date"])
+        _OHLCV_BY_SYM = {s: g.drop(columns="symbol").reset_index(drop=True)
+                         for s, g in df.groupby("symbol")}
+    return _OHLCV_BY_SYM
+
+
 def load_ohlcv(symbol: str, start, end) -> pd.DataFrame:
     """Per-symbol OHLCV. Columns: [date, open, high, low, close, volume].
-
-    POINT-IN-TIME: never returns a row dated after `end`.
+    Served from an in-memory cache (identical data, no per-call SQL). POINT-IN-TIME.
     """
-    con = _source_conn()
-    try:
-        df = pd.read_sql(
-            "SELECT date, open, high, low, close, volume FROM ohlcv WHERE symbol = ?",
-            con, params=(symbol,),
-        )
-    finally:
-        con.close()
-    df["date"] = _parse_dates(df["date"])
+    df = _ohlcv_by_sym().get(symbol)
+    if df is None:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
     start, end = pd.Timestamp(start), pd.Timestamp(end)
-    df = df[(df["date"] >= start) & (df["date"] <= end)]
-    return df.sort_values("date").reset_index(drop=True)
+    return df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
 
 
 def load_benchmark(index_name: str, start, end) -> pd.Series:
@@ -109,6 +119,7 @@ def load_benchmark(index_name: str, start, end) -> pd.Series:
 
 def clear_cache() -> None:
     """Drop the in-memory matrices (used by tests)."""
-    global _PRICE_MATRIX, _VOLUME_MATRIX
+    global _PRICE_MATRIX, _VOLUME_MATRIX, _OHLCV_BY_SYM
     _PRICE_MATRIX = None
     _VOLUME_MATRIX = None
+    _OHLCV_BY_SYM = None

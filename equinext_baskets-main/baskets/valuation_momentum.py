@@ -47,10 +47,15 @@ class ValuationMomentumBasket(Basket):
                                # EXCUSED if its earnings grow >= 20%/yr (growth-adjusted gate)
     FROTH_MAX = FROTH_MAX      # drop names richer than this own-history percentile (sweepable)
 
+    def _universe(self, as_of, ctx):
+        """Investable universe for this rebalance. Override for a different universe
+        (e.g. point-in-time membership)."""
+        return ctx.universe(as_of)
+
     def select(self, as_of, ctx) -> Selection:
         as_of = pd.Timestamp(as_of)
         rows = []
-        for sym in ctx.universe(as_of):
+        for sym in self._universe(as_of, ctx):
             ohlcv = ctx.ohlcv(sym, as_of - pd.Timedelta(days=LOOKBACK_DAYS), as_of)
             if ohlcv.empty:
                 continue
@@ -135,6 +140,45 @@ class ValuationMomentumPEOnly(ValuationMomentumBasket):
     their place or whether P/E alone suffices."""
     name = "vm_pe_only"
     FROTH_MULTIPLES = ("pe",)
+
+
+class ValuationMomentumPIT(ValuationMomentumPEOnly):
+    """SURVIVORSHIP-FREE twin of vm_pe_only. Identical strategy (P/E froth gate +
+    earnings-backed gate + momentum, top 15, inverse-vol, quarterly), but the
+    universe at each rebalance is the POINT-IN-TIME top-50-by-market-cap
+    reconstruction (current 50 + dropped ex-members) instead of today's fixed 50.
+    This includes the 'losers' during the years they were large, removing the
+    survivorship bias that flatters the fixed-membership backtest."""
+    name = "vm_pit"
+
+    def _universe(self, as_of, ctx):
+        from equinext.universe import pit_universe
+        return pit_universe(as_of, top_n=50)
+
+
+class VM500Standard(ValuationMomentumPEOnly):
+    """Nifty 500, STANDARD universe (today's 500 constituents applied backward).
+    Same strategy as the Nifty-50 baskets; only the universe is broader."""
+    name = "vm500"
+
+    def _universe(self, as_of, ctx):
+        from equinext.universe import standard_universe, _pool
+        return standard_universe(as_of, _pool("n500_current"))
+
+
+class VM500PIT(ValuationMomentumPEOnly):
+    """Nifty 500, POINT-IN-TIME (approximate): top-500 by reconstructed market cap
+    from the current 500 + available ex-members. NOTE: a much weaker survivorship
+    fix than the Nifty-50 version — most Nifty-500 dropouts delisted and can't be
+    sourced, so meaningful residual bias remains. Flagged in write-ups."""
+    name = "vm500_pit"
+
+    def _universe(self, as_of, ctx):
+        from equinext.universe import pit_universe, _pool
+        # reconstruct top-500 by market cap each date from the broader Nifty Total
+        # Market pool (~750) — so relegated-but-still-listed ex-members are IN during
+        # the years they were large. (Delisted losers still can't be included.)
+        return pit_universe(as_of, pool=_pool("n500_pool"), top_n=500)
 
 
 class ValuationMomentumGrowthAdj(ValuationMomentumBasket):

@@ -78,6 +78,17 @@ def _period_end_trading_days(idx: pd.DatetimeIndex, freq: str = "M") -> pd.Datet
     return pd.DatetimeIndex(sorted(last.values))
 
 
+def _rebalance_dates(idx: pd.DatetimeIndex, rebalance) -> pd.DatetimeIndex:
+    """Rebalance dates for a cadence: 'Q' quarterly, 'M' monthly, '2M'/'B' bi-monthly."""
+    r = str(rebalance).upper()
+    if r.startswith("Q"):
+        return _period_end_trading_days(idx, "Q")
+    monthly = _period_end_trading_days(idx, "M")
+    if r.startswith("2") or r.startswith("B"):   # bi-monthly = every 2nd month-end
+        return monthly[::2]
+    return monthly
+
+
 def _apply_no_trade_band(current: pd.Series, target: pd.Series, band: float) -> pd.Series:
     """Keep the prior weight on any name whose target moved less than `band`."""
     if band <= 0 or current.empty:
@@ -141,8 +152,7 @@ def run_backtest(basket: Basket, ctx, cfg: BacktestConfig) -> BacktestResult:
     if len(days) == 0:
         raise ValueError("No trading days in the backtest window.")
     daily_ret = px.pct_change(fill_method=None)
-    freq = "Q" if str(cfg.rebalance).upper().startswith("Q") else "M"
-    rebal_dates = _period_end_trading_days(days, freq)
+    rebal_dates = _rebalance_dates(days, cfg.rebalance)
 
     returns = pd.Series(index=days, dtype=float)
     after_tax = pd.Series(index=days, dtype=float)

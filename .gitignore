@@ -1,0 +1,19 @@
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Caches
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db

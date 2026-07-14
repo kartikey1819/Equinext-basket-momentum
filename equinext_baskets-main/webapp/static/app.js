@@ -11,7 +11,16 @@ const LAY = {paper_bgcolor: "transparent", plot_bgcolor: "transparent",
   yaxis: {gridcolor: "#eef1f7", zeroline: false}, showlegend: false};
 const GREEN = "#00b386", BLUE = "#5367ff", GRAY = "#98a0b3", VIOLET = "#7c5cff", AMBER = "#f7a233";
 
-let STOCKS = [], CUR = null, RANGE = 252, _price = 0;
+let STOCKS = [], CUR = null, RANGE = 252, _price = 0, CURINDEX = "n50", CURUNI = "standard", CURCAD = "";
+const BASE = {n50:{standard:"vm_pe_only", pit:"vm_pit"}, n500:{standard:"vm500", pit:"vm500_pit"}};
+const curKey = () => BASE[CURINDEX][CURUNI] + CURCAD;
+const idxKeys = () => ["standard","pit"].flatMap(u => ["","_M","_2M"].map(c => BASE[CURINDEX][u] + c));
+const setFromKey = k => { CURINDEX=k.includes("500")?"n500":"n50"; CURUNI=k.includes("pit")?"pit":"standard"; CURCAD=k.slice(BASE[CURINDEX][CURUNI].length); };
+const ALLKEYS = ["vm_pe_only","vm_pe_only_M","vm_pe_only_2M","vm_pit","vm_pit_M","vm_pit_2M","vm500","vm500_M","vm500_2M","vm500_pit","vm500_pit_M","vm500_pit_2M"];
+
+// session cache — API responses never change during a run, so fetch each URL once (kills toggle lag)
+const _cache = {};
+async function cachedJSON(url){ if(!(url in _cache)) _cache[url] = await (await fetch(url)).json(); return _cache[url]; }
 
 async function boot() {
   const d = await (await fetch("/api/overview")).json();
@@ -27,44 +36,99 @@ function jumpSearch(q){ const m = filterStocks(q); if(q && m.length){ switchView
 
 // ==================== BASKET LANDING ====================
 async function renderBasket(){
-  const [s, b, rbAll] = await Promise.all([
-    (await fetch("/api/strategy")).json(),
-    (await fetch("/api/basket")).json(),
-    (await fetch("/api/rebalances")).json(),
+  const bk = curKey();
+  const q = "?basket=" + bk;
+  const [s, b, rbAll, cmp] = await Promise.all([
+    cachedJSON("/api/strategy" + q),
+    cachedJSON("/api/basket" + q),
+    cachedJSON("/api/rebalances" + q),
+    cachedJSON("/api/compare"),
   ]);
   const REB = rbAll.rebalances || [];
   const m = b.metrics, excess = (m.cagr != null && m.cagr_nifty != null) ? m.cagr - m.cagr_nifty : null;
+  const idxName = cmp[bk].index, cadName = cmp[bk].cadence;
+  const stdK = BASE[CURINDEX].standard + CURCAD, pitK = BASE[CURINDEX].pit + CURCAD;
+  const std = cmp[stdK].metrics, pit = cmp[pitK].metrics;
+  const gap = (std.cagr != null && pit.cagr != null) ? std.cagr - pit.cagr : null;
+  const keys = idxKeys();
+  const pit500 = CURINDEX === "n500";
+  const disc = s.survivorship
+    ? `<div class="disclaimer"><span class="ic">⚠️</span><div><b>Why this number is optimistic.</b> The <b>Standard</b> universe is <b>today's</b> ${idxName} applied to the past — which leaves out companies later dropped from the index after falling (<b>survivorship bias</b>). Treat the CAGR as an upper bound; switch to <b>Point-in-Time</b> for the honest number.</div></div>`
+    : `<div class="disclaimer good"><span class="ic">${pit500?"⚠️":"✅"}</span><div><b>${pit500?"Survivorship-free — but approximate for the Nifty 500.":"This is the survivorship-free result — the trustworthy one."}</b> The universe is whoever was <b>actually</b> a large-cap on each date, including companies later dropped after falling. ${pit500?"<b>Caveat:</b> many Nifty-500 dropouts delisted and can't be sourced, so meaningful residual bias remains here — treat it as a partial correction.":"No hindsight, no cherry-picking today's winners."}</div></div>`;
+
   $("#basket").innerHTML = `
     <div class="hero">
       <div><h1>${s.name}</h1><div class="tag">${s.tagline}</div></div>
-      <div class="asof">Rebalanced ${s.rebalance} · as of ${b.as_of || "—"}</div>
-    </div>
-    <div class="metrics">
-      ${metric("Return (CAGR)", fmt(m.cagr,1)+"%", `Nifty 50: ${fmt(m.cagr_nifty,1)}%`, "up")}
-      ${metric("Beats Nifty by", (excess>=0?"+":"")+fmt(excess,1)+"% / yr", "annualised excess", excess>=0?"up":"down")}
-      ${metric("Sharpe", fmt(m.sharpe,2), "return per unit of risk")}
-      ${metric("Max Drawdown", fmt(m.max_dd,1)+"%", "worst fall (Nifty −38%)", "down")}
-      ${metric("₹100 grew to", "₹"+fmt(m.final,0), `Nifty: ₹${fmt(m.final_nifty,0)} · ${fmt(m.years,1)}y`)}
+      <div class="asof">Rebalanced ${cadName} · as of ${b.as_of || "—"}</div>
     </div>
 
-    <div class="disclaimer">
-      <span class="ic">⚠️</span>
-      <div><b>Why this number is optimistic.</b> These results are backtested on <b>today's</b> Nifty 50 applied to the past — which quietly leaves out companies that were later dropped from the index after falling (this is called <b>survivorship bias</b>). It flatters the returns, so treat the CAGR as an <b>upper bound</b>, not the expected live result.
-        <details><summary>Read more</summary>
-          <p>By using the current 50 constituents backward, we keep the winners and erase the losers that dropped out over the years — so any backtest looks better than reality. The good news: this strategy also beat the Nifty on earlier, different stock sets, so the edge is genuine — just <b>smaller</b> than shown here. The honest fix is <b>point-in-time index membership</b> (testing whoever was actually in the index on each date, losers included), which is the next planned step.</p>
-        </details>
+    <div class="toggles">
+      <div class="btoggle" id="idxtoggle">
+        <button data-i="n50" class="${CURINDEX==="n50"?"on":""}">Nifty 50<small>50 stocks</small></button>
+        <button data-i="n500" class="${CURINDEX==="n500"?"on":""}">Nifty 500<small>broad market</small></button>
+      </div>
+      <div class="btoggle" id="unitoggle">
+        <button data-u="standard" class="${CURUNI==="standard"?"on":""}">Standard<small>today's list</small></button>
+        <button data-u="pit" class="${CURUNI==="pit"?"on":""}">Point-in-Time<small>survivorship-free</small></button>
+      </div>
+      <div class="btoggle" id="cadtoggle">
+        <button data-c="" class="${CURCAD===""?"on":""}">Quarterly</button>
+        <button data-c="_M" class="${CURCAD==="_M"?"on":""}">Monthly</button>
+        <button data-c="_2M" class="${CURCAD==="_2M"?"on":""}">Bi-monthly</button>
       </div>
     </div>
 
+    <div class="card" style="margin-top:14px">
+      <h2>${idxName} — all 6 baskets compared</h2>
+      <div class="lead">Two universes × three rebalance frequencies — same strategy throughout. Click a row to open it. (Use the toggle above to switch between Nifty 50 and Nifty 500.)</div>
+      <table><thead><tr><th>Basket</th><th>CAGR</th><th>After-tax</th><th>Sharpe</th><th>Basket Max DD</th><th>${idxName} Max DD</th><th>Turnover/yr</th><th>₹100→</th></tr></thead>
+      <tbody>${keys.map(k=>{const c=cmp[k]||{},mm=(c.metrics)||{};const rdy=c.ready;return `<tr data-k="${k}" class="${k===bk?"selrow":""}">
+        <td><b>${c.universe||"—"}</b> <span class="cad">· ${c.cadence||""}</span></td>
+        ${rdy?`<td>${fmt(mm.cagr,1)}%</td><td>${fmt(mm.cagr_after_tax,1)}%</td><td>${fmt(mm.sharpe,2)}</td>
+        <td class="down">${fmt(mm.max_dd,1)}%</td><td class="down">${fmt(mm.max_dd_nifty,1)}%</td><td>${fmt(mm.turnover_yr,0)}%</td><td>₹${fmt(mm.final,0)}</td>`
+        :`<td colspan="7" style="color:var(--muted)">not yet computed</td>`}</tr>`}).join("")}</tbody></table>
+      <div class="gapnote" style="text-align:left">Nifty benchmark over the same window: <b>${fmt(std.cagr_nifty,1)}%/yr</b>. Where present, the <b>Standard</b> rows sit above the <b>Point-in-Time</b> rows — that gap is survivorship bias, not skill.</div>
+    </div>
+
     <div class="card">
-      <h3 class="mini">Growth of ₹100 — Basket vs Nifty 50</h3>
-      <div class="legend"><span><b style="background:${GREEN}"></b>Basket</span><span><b style="background:${GRAY}"></b>Nifty 50</span></div>
-      <div id="curve" style="height:320px"></div>
+      <h3 class="mini">Survivorship gap · ${idxName} · ${cadName}</h3>
+      <div class="cmp">
+        <div class="cmpbox opt"><div class="lbl">Standard · optimistic</div><div class="big up">${fmt(std.cagr,1)}%</div><div class="d">CAGR · ₹100→₹${fmt(std.final,0)}</div></div>
+        <div class="gap"><div class="n">−${fmt(gap,1)}%</div><div class="l">bias / yr</div></div>
+        <div class="cmpbox real"><div class="lbl">Point-in-Time · real</div><div class="big up">${fmt(pit.cagr,1)}%</div><div class="d">CAGR · ₹100→₹${fmt(pit.final,0)}</div></div>
+      </div>
+      <div class="legend" style="margin-top:16px"><span><b style="background:${GREEN}"></b>Standard</span><span><b style="background:${VIOLET}"></b>Point-in-Time</span><span><b style="background:${GRAY}"></b>${idxName}</span></div>
+      <div id="curve" style="height:300px"></div>
+    </div>
+
+    ${disc}
+
+    <div class="metrics">
+      ${metric("Return (CAGR)", fmt(m.cagr,1)+"%", `full period · ${idxName}: ${fmt(m.cagr_nifty,1)}%`, "up")}
+      ${metric("Beats index by", (excess>=0?"+":"")+fmt(excess,1)+"% / yr", "annualised excess", excess>=0?"up":"down")}
+      ${metric("Sharpe", fmt(m.sharpe,2), "return per unit of risk")}
+      ${metric("Max Drawdown", fmt(m.max_dd,1)+"%", "worst peak-to-trough fall", "down")}
+      ${metric("₹100 grew to", "₹"+fmt(m.final,0), `${idxName}: ₹${fmt(m.final_nifty,0)} · ${fmt(m.years,1)}y`)}
+    </div>
+
+    <div class="card">
+      <h2>Returns by period</h2>
+      <div class="lead">The CAGR above covers the whole backtest. Pick a trailing window below to see how the basket did versus ${idxName} over just that stretch — computed straight from the daily backtest curve.</div>
+      <div class="btoggle" id="pertoggle">
+        <button data-mo="1">1M</button>
+        <button data-mo="3">3M</button>
+        <button data-mo="6">6M</button>
+        <button data-mo="12" class="on">1Y</button>
+        <button data-mo="36">3Y</button>
+        <button data-mo="60">5Y</button>
+        <button data-mo="">Max</button>
+      </div>
+      <div id="periodout"></div>
     </div>
 
     <div class="card">
       <h2>How this basket is built</h2>
-      <div class="lead">Four steps, applied fresh every quarter. Momentum <b>ranks</b> the stocks; valuation & earnings <b>gate</b> out the risky ones.</div>
+      <div class="lead">Four steps, applied fresh every rebalance. Momentum <b>ranks</b> the stocks; valuation & earnings <b>gate</b> out the risky ones.</div>
       <div class="steps">${s.steps.map(stepCard).join("")}</div>
     </div>
 
@@ -73,11 +137,11 @@ async function renderBasket(){
       <div class="selbox">
         <ol>${s.selection.points.map(p=>`<li>${boldFirst(p)}</li>`).join("")}</ol>
         <div class="flow">
-          <div class="fbox"><b>Step 1</b>${s.n_universe} Nifty 50 stocks</div>
+          <div class="fbox"><b>Step 1</b>${s.n_universe} ${idxName} stocks</div>
           <div class="arrow">↓ &nbsp;filter</div>
-          <div class="fbox"><b>Gates 2 & 4</b>Drop frothy & hype-driven</div>
+          <div class="fbox"><b>Gates 2 & 3</b>Drop frothy & hype-driven</div>
           <div class="arrow">↓ &nbsp;rank</div>
-          <div class="fbox"><b>Step 3</b>Rank survivors by momentum</div>
+          <div class="fbox"><b>Step 4</b>Rank survivors by momentum</div>
           <div class="arrow">↓ &nbsp;select & size</div>
           <div class="fbox final">Top ${s.n_hold} · inverse-vol weighted</div>
         </div>
@@ -99,8 +163,8 @@ async function renderBasket(){
     </div>
 
     <div class="card">
-      <h2>Rebalance History <span style="color:var(--muted);font-weight:500;font-size:14px">· ${REB.length} quarters</span></h2>
-      <div class="lead">Every quarter the basket is rebuilt — here's exactly what it bought and sold each time.</div>
+      <h2>Rebalance History <span style="color:var(--muted);font-weight:500;font-size:14px">· ${REB.length} rebalances</span></h2>
+      <div class="lead">Every rebalance the basket is rebuilt — here's exactly what it bought and sold each time.</div>
       <div class="rebal" id="rebal"></div>
       ${REB.length>8?`<button class="showall" id="showall">Show all ${REB.length} rebalances ↓</button>`:""}
     </div>`;
@@ -120,16 +184,71 @@ async function renderBasket(){
   paint(REB.slice(0,8));
   if($("#showall")) $("#showall").onclick = e => { paint(REB); e.target.remove(); };
 
-  if(b.curve && b.curve.dates){
-    Plotly.newPlot("curve",[
-      {x:b.curve.dates,y:b.curve.nifty,type:"scatter",mode:"lines",line:{color:GRAY,width:1.6},name:"Nifty"},
-      {x:b.curve.dates,y:b.curve.basket,type:"scatter",mode:"lines",line:{color:GREEN,width:2.4},
-        fill:"tozeroy",fillcolor:"rgba(0,179,134,.07)",name:"Basket"}],
-      {...LAY,height:320,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
-  }
-  document.querySelectorAll("#basket tbody tr").forEach(r=>r.onclick=()=>{switchView("stocks");selectStock(r.dataset.sym);});
+  // overlay Standard + Point-in-Time (this index & cadence) + Nifty; highlight selected universe
+  const cs = (cmp[stdK]||{}).curve, cp = (cmp[pitK]||{}).curve;
+  if(cs && cs.dates){
+    const wS = CURUNI==="standard"?2.8:1.4, wP = CURUNI==="pit"?2.8:1.4;
+    const tr = [{x:cs.dates,y:cs.nifty,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:idxName},
+      {x:cs.dates,y:cs.basket,type:"scatter",mode:"lines",line:{color:GREEN,width:wS},name:"Standard"}];
+    if(cp && cp.dates) tr.push({x:cp.dates,y:cp.basket,type:"scatter",mode:"lines",line:{color:VIOLET,width:wP},name:"Point-in-Time"});
+    Plotly.newPlot("curve",tr,{...LAY,height:300,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
+  } else { $("#curve").innerHTML = '<div class="loading">Not computed yet.</div>'; }
+
+  // trailing-period returns, computed from the daily backtest curve
+  PCURVE = b.curve; PIDX = idxName;
+  document.querySelectorAll("#pertoggle button").forEach(bn=>bn.onclick=()=>{
+    document.querySelectorAll("#pertoggle button").forEach(x=>x.classList.toggle("on", x===bn));
+    renderPeriod(bn.dataset.mo===""?null:+bn.dataset.mo);
+  });
+  renderPeriod(12);
+
+  document.querySelectorAll("#idxtoggle button").forEach(bn=>bn.onclick=()=>{ CURINDEX=bn.dataset.i; renderBasket(); });
+  document.querySelectorAll("#unitoggle button").forEach(bn=>bn.onclick=()=>{ CURUNI=bn.dataset.u; renderBasket(); });
+  document.querySelectorAll("#cadtoggle button").forEach(bn=>bn.onclick=()=>{ CURCAD=bn.dataset.c; renderBasket(); });
+  document.querySelectorAll("#basket table tbody tr[data-k]").forEach(r=>r.onclick=()=>{ setFromKey(r.dataset.k); renderBasket(); });
+  document.querySelectorAll("#basket tbody tr[data-sym]").forEach(r=>r.onclick=()=>{switchView("stocks");selectStock(r.dataset.sym);});
 }
 const metric = (k,v,sub,c="") => `<div class="metric"><div class="k">${k}</div><div class="v ${c}">${v}</div><div class="sub">${sub}</div></div>`;
+
+// ---- trailing-period returns from the daily backtest curve ----
+let PCURVE = null, PIDX = "";
+const _iso = dt => dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0")+"-"+String(dt.getDate()).padStart(2,"0");
+function trailingStats(curve, months){
+  if(!curve || !curve.dates || curve.dates.length < 2) return null;
+  const {dates, basket:bs, nifty:ns} = curve, n = dates.length;
+  let i0 = 0;
+  if(months != null){
+    const end = new Date(dates[n-1] + "T00:00");
+    const cut = new Date(end); cut.setMonth(cut.getMonth() - months);
+    const cutStr = _iso(cut);
+    const f = dates.findIndex(d => d >= cutStr);
+    i0 = f < 0 ? n-1 : f;
+    if(i0 >= n-1) return null;                 // window longer than the backtest
+  }
+  const yrs = (new Date(dates[n-1]+"T00:00") - new Date(dates[i0]+"T00:00")) / 3.15576e10;
+  const bRet = bs[n-1]/bs[i0] - 1, nRet = ns[n-1]/ns[i0] - 1;
+  const ann = yrs >= 1;
+  return {from:dates[i0], to:dates[n-1], yrs,
+          bRet:bRet*100, nRet:nRet*100,
+          bCagr: ann ? (Math.pow(bs[n-1]/bs[i0], 1/yrs)-1)*100 : null,
+          nCagr: ann ? (Math.pow(ns[n-1]/ns[i0], 1/yrs)-1)*100 : null};
+}
+function renderPeriod(months){
+  const out = $("#periodout"); if(!out) return;
+  const st = trailingStats(PCURVE, months);
+  if(!st){ out.innerHTML = '<div class="lead" style="color:var(--muted)">Not enough backtest history for this window.</div>'; return; }
+  const exc = st.bRet - st.nRet;
+  const sgn = x => (x>=0?"+":"") + fmt(x,1) + "%";
+  const annNote = st.bCagr!=null
+    ? `<div class="lead" style="margin-top:10px">Annualised (CAGR) over this window — basket <b class="up">${fmt(st.bCagr,1)}%</b> vs ${PIDX} <b>${fmt(st.nCagr,1)}%</b>.</div>`
+    : `<div class="lead" style="margin-top:10px">Window is under a year, so these are <b>total</b> returns for the period — not annualised (annualising a few months would be misleading).</div>`;
+  out.innerHTML = `
+    <div class="metrics" style="margin-top:12px">
+      ${metric("Basket return", sgn(st.bRet), `${st.from} → ${st.to}`, st.bRet>=0?"up":"down")}
+      ${metric(PIDX+" return", sgn(st.nRet), "same window", st.nRet>=0?"up":"down")}
+      ${metric("Excess vs index", sgn(exc), "basket − index", exc>=0?"up":"down")}
+    </div>${annNote}`;
+}
 const ROLE = {universe:"Eligibility",valuation:"Filter",momentum:"Ranks",earnings:"Filter"};
 function stepCard(st){
   return `<div class="step"><div class="top"><div class="num">${st.n}</div>
@@ -155,7 +274,7 @@ async function selectStock(sym){
   CUR=sym;
   document.querySelectorAll(".srow").forEach(r=>r.classList.toggle("sel",r.dataset.sym===sym));
   $("#detail").innerHTML='<div class="loading">Loading '+sym+'…</div>';
-  const d=await (await fetch("/api/stock/"+sym)).json();
+  const d=await cachedJSON("/api/stock/"+sym);
   renderDetail(d);
 }
 function renderDetail(d){
@@ -231,9 +350,41 @@ const lineC=(id,x,y,c)=>Plotly.newPlot(id,[{x,y,type:"scatter",mode:"lines",line
 function drawFund(f){const y=f.map(r=>r.year);barC("f_eps",y,f.map(r=>r.eps),BLUE);barC("f_pat",y,f.map(r=>r.pat),GREEN);barC("f_bv",y,f.map(r=>r.book_value),VIOLET);barC("f_roe",y,f.map(r=>r.roe),AMBER);}
 function drawVal(v){lineC("v_pe",v.dates,v.pe,BLUE);lineC("v_pb",v.dates,v.pb,GREEN);lineC("v_ev",v.dates,v.ev_ebitda,VIOLET);lineC("v_fcf",v.dates,v.fcf_yield.map(x=>x==null?null:x*100),AMBER);}
 
+// ==================== COMPARE ALL 12 ====================
+async function renderCompareAll(){
+  const cmp = await cachedJSON("/api/compare");
+  const rows = ALLKEYS.map(k=>cmp[k]).filter(c=>c&&c.ready);
+  const bestC = Math.max(...rows.map(c=>c.metrics.cagr));
+  const bestS = Math.max(...rows.map(c=>c.metrics.sharpe));
+  const bestDD = Math.max(...rows.map(c=>c.metrics.max_dd));   // least-negative = best
+  const hi = on => on ? ' style="font-weight:800;color:var(--brand-d)"' : '';
+  $("#compareall").innerHTML = `
+    <h1 style="margin:0 0 4px">All 12 baskets — master comparison</h1>
+    <div style="color:var(--sub);margin-bottom:16px">Same strategy across <b>2 indices × 2 universes × 3 rebalance cadences</b>. Click any row to open that basket.</div>
+    <div class="card">
+      <table><thead><tr><th>Index</th><th>Universe</th><th>Cadence</th><th>CAGR</th><th>vs index</th><th>After-tax</th><th>Sharpe</th><th>Basket Max DD</th><th>Index Max DD</th><th>Turn/yr</th><th>₹100→</th></tr></thead>
+      <tbody>${ALLKEYS.map(k=>{const c=cmp[k];if(!c||!c.ready)return "";const m=c.metrics;const exc=m.cagr-m.cagr_nifty;
+        return `<tr data-k="${k}" class="${k===curKey()?"selrow":""}">
+          <td><b>${c.index}</b></td>
+          <td>${c.universe}${c.survivorship?"":' <span class="pill sec" style="font-size:9.5px">honest</span>'}</td>
+          <td>${c.cadence}</td>
+          <td${hi(m.cagr===bestC)}>${fmt(m.cagr,1)}%</td>
+          <td class="${exc>=0?'up':'down'}">${exc>=0?'+':''}${fmt(exc,1)}%</td>
+          <td>${fmt(m.cagr_after_tax,1)}%</td>
+          <td${hi(m.sharpe===bestS)}>${fmt(m.sharpe,2)}</td>
+          <td class="down">${fmt(m.max_dd,1)}%</td>
+          <td class="down">${fmt(m.max_dd_nifty,1)}%</td>
+          <td>${fmt(m.turnover_yr,0)}%</td>
+          <td${hi(m.final===Math.max(...rows.map(x=>x.metrics.final)))}>₹${fmt(m.final,0)}</td></tr>`}).join("")}</tbody></table>
+      <div class="gapnote" style="text-align:left;margin-top:14px">⚠️ <b>Read honestly.</b> <b>Point-in-Time</b> removes survivorship bias by including companies that later dropped out. The <b>Nifty 50 · Point-in-Time</b> rows (~13%) are the one <b>fully-trustworthy</b> result. Nifty-500 numbers stay inflated — even PIT-500 can't include delisted losers (the biggest broad-market survivorship source), so treat them as optimistic upper bounds. Higher headline returns on the Nifty 500 also come with deeper drawdowns (−40%) and far higher turnover.</div>
+    </div>`;
+  document.querySelectorAll("#compareall tbody tr[data-k]").forEach(r=>r.onclick=()=>{ setFromKey(r.dataset.k); switchView("basket"); renderBasket(); });
+}
+
 // nav
 function switchView(v){
   document.querySelectorAll(".navtab").forEach(b=>b.classList.toggle("active",b.dataset.view===v));
-  $("#basket-view").hidden=v!=="basket"; $("#stocks-view").hidden=v!=="stocks";
+  $("#basket-view").hidden=v!=="basket"; $("#stocks-view").hidden=v!=="stocks"; $("#compare-view").hidden=v!=="compare";
+  if(v==="compare") renderCompareAll();
 }
 boot();

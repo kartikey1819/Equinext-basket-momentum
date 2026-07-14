@@ -213,7 +213,13 @@ def _f(v):
 
 def main(argv):
     refetch = "--refetch" in argv
-    syms = [a.upper() for a in argv if not a.startswith("--")] or NIFTY50
+    if "--n500" in argv or "--tm" in argv:     # scrape the Nifty 500 / Total-Market list
+        import csv
+        fn = "nifty_totalmarket.csv" if "--tm" in argv else "nifty500_official.csv"
+        with open(_REPO / fn, encoding="utf-8") as f:
+            syms = [r["Symbol"].strip().upper() for r in csv.DictReader(f) if r.get("Symbol")]
+    else:
+        syms = [a.upper() for a in argv if not a.startswith("--")] or NIFTY50
 
     prj = sqlite3.connect(str(PROJECT_DB))
     src = sqlite3.connect(str(SOURCE_DB))

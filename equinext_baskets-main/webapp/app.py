@@ -21,13 +21,45 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, render_template, abort
+from flask import Flask, jsonify, render_template, abort, request
 
 _REPO = Path(__file__).resolve().parents[1]
 SOURCE_DB = _REPO.parent / "nifty500_hrp.db"
 PROJECT_DB = _REPO / "equinext.db"
-BASKET = "vm_pe_only"          # the final basket: P/E froth gate + earnings gate + momentum
-BACKTEST_CSV = _REPO / f"backtest_{BASKET}.csv"
+
+# 12 baskets = 2 indices x 2 universes x 3 rebalance cadences (same strategy throughout).
+_BASES = {
+    "vm_pe_only": {"index": "Nifty 50", "uni": "Standard", "survivorship": True,
+                   "note": "the 50 official Nifty 50 constituents (today's list)",
+                   "tag": "Own the strongest Nifty 50 stocks — but only the ones that aren't overpriced and whose rise is backed by real earnings."},
+    "vm_pit": {"index": "Nifty 50", "uni": "Point-in-Time", "survivorship": False,
+               "note": "the top 50 by market cap reconstructed on each date (ex-members included during the years they were large)",
+               "tag": "The same strategy, tested honestly on whoever was actually a Nifty-50-sized stock on each date — the survivorship-free result."},
+    "vm500": {"index": "Nifty 500", "uni": "Standard", "survivorship": True,
+              "note": "the 500 official Nifty 500 constituents (today's list)",
+              "tag": "The same strategy across the broad market — the strongest, reasonably-priced, earnings-backed of India's 500 largest listed companies."},
+    "vm500_pit": {"index": "Nifty 500", "uni": "Point-in-Time", "survivorship": False,
+                  "note": "top 500 by reconstructed market cap each date (APPROXIMATE — many Nifty-500 dropouts delisted and can't be sourced, so residual bias remains)",
+                  "tag": "The broad-market strategy tested survivorship-free — approximate, since most Nifty-500 dropouts delisted and can't be included."},
+}
+_CADENCES = {"": "Quarterly", "_M": "Monthly", "_2M": "Bi-monthly"}
+
+BASKET_META = {
+    base + sfx: {"label": f"{b['index']} · {b['uni']} · {cad}", "index": b["index"],
+                 "universe": b["uni"], "cadence": cad, "survivorship": b["survivorship"],
+                 "universe_note": b["note"], "tagline": b["tag"]}
+    for base, b in _BASES.items() for sfx, cad in _CADENCES.items()
+}
+DEFAULT_BASKET = "vm_pe_only"
+
+
+def _basket_name():
+    b = request.args.get("basket", DEFAULT_BASKET)
+    return b if b in BASKET_META else DEFAULT_BASKET
+
+
+def _bt_csv(basket):
+    return _REPO / f"backtest_{basket}.csv"
 
 app = Flask(__name__)
 
@@ -59,15 +91,15 @@ def _securities() -> pd.DataFrame:
     return df.set_index("symbol")
 
 
-@lru_cache(maxsize=1)
-def _latest_holdings() -> dict:
+@lru_cache(maxsize=4)
+def _latest_holdings(basket=DEFAULT_BASKET) -> dict:
     con = sqlite3.connect(str(PROJECT_DB))
-    d = con.execute("SELECT MAX(as_of) FROM basket_holdings WHERE basket=?", (BASKET,)).fetchone()[0]
+    d = con.execute("SELECT MAX(as_of) FROM basket_holdings WHERE basket=?", (basket,)).fetchone()[0]
     if not d:
         con.close()
         return {"as_of": None, "holdings": {}}
     rows = con.execute("SELECT symbol, weight, score FROM basket_holdings WHERE basket=? AND as_of=?",
-                       (BASKET, d)).fetchall()
+                       (basket, d)).fetchall()
     con.close()
     return {"as_of": d, "holdings": {r[0]: {"weight": r[1], "score": r[2]} for r in rows}}
 
@@ -230,9 +262,53 @@ def stock(symbol):
     })
 
 
+def _turnover_yr(basket, yrs):
+    """Annualised two-sided turnover from the stored holdings history."""
+    con = sqlite3.connect(str(PROJECT_DB))
+    df = pd.read_sql("SELECT as_of, symbol, weight FROM basket_holdings WHERE basket=? ORDER BY as_of",
+                     con, params=(basket,))
+    con.close()
+    if df.empty or not yrs:
+        return None
+    dates = sorted(df["as_of"].unique())
+    prev, tot = {}, []
+    for d in dates:
+        cur = dict(zip(df[df.as_of == d].symbol, df[df.as_of == d].weight))
+        tot.append(sum(abs(cur.get(s, 0) - prev.get(s, 0)) for s in set(cur) | set(prev)))
+        prev = cur
+    return (sum(tot) / len(tot)) * (len(dates) / yrs) * 100
+
+
+@lru_cache(maxsize=32)
+def _curve_metrics(basket):
+    csv = _bt_csv(basket)
+    if not csv.exists():
+        return {}, {}
+    df = pd.read_csv(csv, index_col=0, parse_dates=True)
+    b = df["basket"].dropna(); n = df["nifty50"].reindex(b.index).fillna(0)
+    cb = (1 + b).cumprod() * 100; cn = (1 + n).cumprod() * 100
+    curve = {"dates": cb.index.strftime("%Y-%m-%d").tolist(),
+             "basket": [_clean(v) for v in cb.tolist()], "nifty": [_clean(v) for v in cn.tolist()]}
+    yrs = (b.index[-1] - b.index[0]).days / 365
+    cagr = (cb.iloc[-1] / 100) ** (1 / yrs) - 1
+    dd = (cb / cb.cummax() - 1).min()
+    dd_nifty = (cn / cn.cummax() - 1).min()
+    at = df["basket_after_tax"].dropna() if "basket_after_tax" in df.columns else None
+    at_cagr = (((1 + at).prod()) ** (252 / len(at)) - 1) if at is not None and len(at) else None
+    metrics = {"cagr": _clean(cagr * 100), "cagr_nifty": _clean(((cn.iloc[-1] / 100) ** (1 / yrs) - 1) * 100),
+               "cagr_after_tax": _clean(at_cagr * 100 if at_cagr is not None else None),
+               "sharpe": _clean(cagr / (b.std() * np.sqrt(252))),
+               "max_dd": _clean(dd * 100), "max_dd_nifty": _clean(dd_nifty * 100),
+               "final": _clean(cb.iloc[-1]),
+               "final_nifty": _clean(cn.iloc[-1]), "years": _clean(yrs),
+               "turnover_yr": _clean(_turnover_yr(basket, yrs))}
+    return curve, metrics
+
+
 @app.route("/api/basket")
 def basket():
-    held = _latest_holdings()
+    bk = _basket_name()
+    held = _latest_holdings(bk)
     px = _prices()
     secs = _securities()
     rows = []
@@ -245,31 +321,29 @@ def basket():
                      "weight": _clean(h["weight"] * 100), "score": _clean(h["score"]),
                      "price": _clean(last), "change_pct": _clean((last / prev - 1) * 100 if last else None)})
     rows.sort(key=lambda r: -(r["weight"] or 0))
+    curve, metrics = _curve_metrics(bk)
+    return jsonify({"basket": bk, "as_of": held["as_of"], "holdings": rows, "curve": curve, "metrics": metrics})
 
-    curve, metrics = {}, {}
-    if BACKTEST_CSV.exists():
-        df = pd.read_csv(BACKTEST_CSV, index_col=0, parse_dates=True)
-        b = df["basket"].dropna(); n = df["nifty50"].reindex(b.index).fillna(0)
-        cb = (1 + b).cumprod() * 100; cn = (1 + n).cumprod() * 100
-        curve = {"dates": cb.index.strftime("%Y-%m-%d").tolist(),
-                 "basket": [_clean(v) for v in cb.tolist()], "nifty": [_clean(v) for v in cn.tolist()]}
-        yrs = (b.index[-1] - b.index[0]).days / 365
-        cagr = (cb.iloc[-1] / 100) ** (1 / yrs) - 1
-        dd = (cb / cb.cummax() - 1).min()
-        cagr_n = (cn.iloc[-1] / 100) ** (1 / yrs) - 1
-        metrics = {"cagr": _clean(cagr * 100), "cagr_nifty": _clean(cagr_n * 100),
-                   "sharpe": _clean(cagr / (b.std() * np.sqrt(252))),
-                   "max_dd": _clean(dd * 100), "final": _clean(cb.iloc[-1]),
-                   "final_nifty": _clean(cn.iloc[-1]), "years": _clean(yrs)}
-    return jsonify({"as_of": held["as_of"], "holdings": rows, "curve": curve, "metrics": metrics})
+
+@app.route("/api/compare")
+def compare():
+    """All baskets' curves + metrics side by side — for the comparison table & overlay."""
+    out = {}
+    for bk, meta in BASKET_META.items():
+        curve, metrics = _curve_metrics(bk)
+        out[bk] = {"label": meta["label"], "index": meta["index"], "universe": meta["universe"],
+                   "cadence": meta["cadence"], "survivorship": meta["survivorship"],
+                   "ready": bool(metrics), "curve": curve, "metrics": metrics}
+    return jsonify(out)
 
 
 @app.route("/api/rebalances")
 def rebalances():
     """The basket's trade history — what was bought/sold at each quarterly rebalance."""
+    bk = _basket_name()
     con = sqlite3.connect(str(PROJECT_DB))
     df = pd.read_sql("SELECT as_of, symbol, weight FROM basket_holdings WHERE basket=? ORDER BY as_of",
-                     con, params=(BASKET,))
+                     con, params=(bk,))
     con.close()
     if df.empty:
         return jsonify({"rebalances": []})
@@ -288,10 +362,15 @@ def rebalances():
 @app.route("/api/strategy")
 def strategy():
     """The basket's construction criteria — the 'why', with real thresholds."""
-    n_universe = len(_securities())
+    bk = _basket_name()
+    meta = BASKET_META[bk]
+    n_universe = 500 if bk.startswith("vm500") else 50
     return jsonify({
-        "name": "Equinext Valuation-Momentum Basket",
-        "tagline": "Own the strongest Nifty 50 stocks — but only the ones that aren't overpriced and whose rise is backed by real earnings.",
+        "basket": bk,
+        "label": meta["label"],
+        "survivorship": meta["survivorship"],
+        "name": f"Equinext Valuation-Momentum · {meta['label']}",
+        "tagline": meta["tagline"],
         "n_universe": n_universe,
         "n_hold": 15,
         "rebalance": "Quarterly",
@@ -300,7 +379,7 @@ def strategy():
             {"n": 1, "key": "universe", "title": "Universe Filter",
              "icon": "filter",
              "why": "Only large, liquid, established companies you can actually trade without moving the price.",
-             "criteria": [f"{n_universe} official Nifty 50 constituents",
+             "criteria": [meta["universe_note"],
                           "Median traded value ≥ ₹5 cr/day (63-day)",
                           "Free-float market cap ≥ ₹100 cr",
                           "At least ~1 year of price history"]},
@@ -310,24 +389,24 @@ def strategy():
              "criteria": ["Rank today's P/E within the stock's own 5-year history",
                           "Drop any stock above its 80th percentile (its own expensive extreme)",
                           "This filters out the frothy; it does not rank"]},
-            {"n": 3, "key": "momentum", "title": "Momentum Score",
+            {"n": 3, "key": "earnings", "title": "Earnings-Backed Gate",
+             "icon": "check",
+             "why": "Keep only rises driven by real profit growth, not hype. Story stocks collapse in downturns.",
+             "criteria": ["Split the 12-month rise into earnings vs multiple (hype)",
+                          "Keep only if earnings did at least half the work",
+                          "Drops pure multiple-expansion names"]},
+            {"n": 4, "key": "momentum", "title": "Momentum Score",
              "icon": "trend",
              "why": "Ride the strongest, most broadly-confirmed uptrends — stocks going up tend to keep going up.",
              "criteria": ["12-month return (skipping the last month)",
                           "Distance from the 52-week high",
                           "Volume trend (rising participation)",
                           "Each z-scored vs peers, then averaged into one score"]},
-            {"n": 4, "key": "earnings", "title": "Earnings-Backed Gate",
-             "icon": "check",
-             "why": "Keep only rises driven by real profit growth, not hype. Story stocks collapse in downturns.",
-             "criteria": ["Split the 12-month rise into earnings vs multiple (hype)",
-                          "Keep only if earnings did at least half the work",
-                          "Drops pure multiple-expansion names"]},
         ],
         "selection": {
             "title": "How the 15 stocks are chosen & weighted",
             "points": [
-                "Every quarter, all 50 stocks pass through the funnel above.",
+                f"At each rebalance, all {n_universe} {meta['index']} stocks pass through the funnel above.",
                 "The valuation & earnings gates remove the risky names.",
                 "Survivors are ranked by momentum score — the top 15 are held.",
                 "Each is weighted by inverse-volatility: steadier stocks get a bigger slice, so no single wild stock dominates the risk.",

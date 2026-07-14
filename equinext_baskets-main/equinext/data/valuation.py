@@ -26,40 +26,41 @@ def _project_conn() -> sqlite3.Connection:
     return sqlite3.connect(str(_PROJECT_DB))
 
 
-def read_valuation_series(symbol: str, end, lookback_years: int = 7) -> pd.DataFrame:
-    """Read [date, pe, pb, ev_ebitda] up to `end`, trailing `lookback_years`."""
-    end = pd.Timestamp(end)
-    con = _project_conn()
-    try:
+_VAL_BY_SYM: dict | None = None       # per-symbol valuation series, loaded once
+
+
+def _val_by_sym() -> dict:
+    global _VAL_BY_SYM
+    if _VAL_BY_SYM is None:
+        con = _project_conn()
         try:
             df = pd.read_sql(
-                "SELECT date, pe, pb, ev_ebitda, fcf_yield, eps_ttm "
-                "FROM valuation_series WHERE symbol = ?",
-                con, params=(symbol,),
-            )
+                "SELECT symbol, date, pe, pb, ev_ebitda, fcf_yield, eps_ttm FROM valuation_series", con)
         except Exception:
-            # older DB without the extra columns — fall back to the core three
-            try:
-                df = pd.read_sql(
-                    "SELECT date, pe, pb, ev_ebitda FROM valuation_series WHERE symbol = ?",
-                    con, params=(symbol,),
-                )
-            except Exception:
-                df = pd.DataFrame()
-    finally:
-        con.close()
+            df = pd.DataFrame()
+        finally:
+            con.close()
+        if df.empty:
+            _VAL_BY_SYM = {}
+        else:
+            df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+            df = df.sort_values(["symbol", "date"])
+            _VAL_BY_SYM = {s: g.drop(columns="symbol").reset_index(drop=True)
+                           for s, g in df.groupby("symbol")}
+    return _VAL_BY_SYM
 
-    if df.empty:
+
+def read_valuation_series(symbol: str, end, lookback_years: int = 7) -> pd.DataFrame:
+    """Read [date, pe, pb, ev_ebitda, fcf_yield, eps_ttm] up to `end`, trailing
+    `lookback_years`. Served from an in-memory cache (identical data, no per-call SQL)."""
+    end = pd.Timestamp(end)
+    df = _val_by_sym().get(symbol)
+    if df is None or df.empty:
         raise NotImplementedError(
-            "valuation_series is empty. Populate it first: derive multiples from "
-            "prices x fundamentals via build_valuation_series_from_fundamentals(), "
-            "or load a vendor series. See equinext/data/valuation.py."
-        )
-
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+            "valuation_series is empty for this symbol. Populate it first (screener/"
+            "fundamentals x prices). See equinext/data/valuation.py.")
     cutoff = end - pd.Timedelta(days=int(lookback_years * 365))
-    df = df[(df["date"] <= end) & (df["date"] >= cutoff)]
-    return df.sort_values("date").reset_index(drop=True)
+    return df[(df["date"] <= end) & (df["date"] >= cutoff)].reset_index(drop=True)
 
 
 def build_valuation_series_from_fundamentals(symbol: str) -> pd.DataFrame:
