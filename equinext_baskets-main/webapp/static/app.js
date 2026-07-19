@@ -10,6 +10,129 @@ const LAY = {paper_bgcolor: "transparent", plot_bgcolor: "transparent",
   margin: {l: 46, r: 12, t: 10, b: 28}, xaxis: {gridcolor: "#eef1f7", zeroline: false},
   yaxis: {gridcolor: "#eef1f7", zeroline: false}, showlegend: false};
 const GREEN = "#00b386", BLUE = "#5367ff", GRAY = "#98a0b3", VIOLET = "#7c5cff", AMBER = "#f7a233";
+const SECCOL = {
+  "Financial Services":"#5367ff", "Industrials":"#f7a233", "Consumer Cyclical":"#ec4899",
+  "Basic Materials":"#8b5cf6", "Healthcare":"#00b386", "Technology":"#06b6d4",
+  "Consumer Defensive":"#84cc16", "Utilities":"#eab308", "Real Estate":"#a855f7",
+  "Communication Services":"#14b8a6", "Energy":"#ef4444", "Unknown":"#98a0b3"};
+const seccol = s => SECCOL[s] || "#c0c6d4";
+const SECNAME = {"Financial Services":"Financials", "Communication Services":"Communication",
+  "Consumer Defensive":"Consumer Staples", "Information Technology":"Technology",
+  "Unknown":"Other / Unclassified"};
+const secname = s => SECNAME[s] || s;
+
+// Shared RupeeCase-style sector-rotation heat-map: rows = sectors (sorted by today's
+// weight, not-held ones "OUT" at the bottom), columns = rebalances, blue intensity =
+// % of book. Fills host with a summary header + the plot. Used by the dynamic baskets
+// AND the 12 main baskets, so both read identically.
+function renderSectorHeatmap(sa, hostId){
+  const host = $("#"+hostId); if(!host) return;
+  if(!sa || !sa.sectors || !sa.sectors.length){ host.innerHTML = '<div class="lead" style="color:var(--muted)">No sector data for this basket yet.</div>'; return; }
+  const last = sa.dates.length - 1;
+  const peak = s => Math.max.apply(null, sa.series[s]);
+  const cur = {}; sa.sectors.forEach(s => cur[s] = sa.series[s][last]);
+  const held = sa.sectors.filter(s => cur[s] > 0.05).sort((a,b) => cur[b] - cur[a]);
+  const outs = sa.sectors.filter(s => cur[s] <= 0.05).sort((a,b) => peak(b) - peak(a));
+  const display = [...held, ...outs];                 // top -> bottom
+  const yOrder = display.slice().reverse();           // Plotly draws bottom -> top
+  const z = yOrder.map(s => sa.series[s]);
+  const ylab = yOrder.map(secname);
+  const nTouched = sa.sectors.filter(s => peak(s) > 0.05).length;
+  const anns = yOrder.map(s => ({xref:"paper", x:1.015, xanchor:"left", yref:"y", y:secname(s),
+    text: cur[s] > 0.05 ? Math.round(cur[s])+"%" : "OUT", showarrow:false,
+    font:{size:11, color: cur[s] > 0.05 ? "#5b6172" : "#b9bfcc"}}));
+  const H = Math.max(300, display.length*24 + 56);
+  host.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:8px">
+      <div>
+        <div style="letter-spacing:.09em;font-size:11px;font-weight:700;color:var(--muted)">SECTOR ROTATION</div>
+        <div style="font-size:18px;font-weight:700;margin-top:3px">${sa.dates.length} rebalances · ${nTouched} sectors touched · ${held.length} live today</div>
+      </div>
+      <div style="color:var(--muted);font-size:11px;text-align:right;margin-top:6px;line-height:1.6">
+        <span style="display:inline-block;width:36px;height:9px;border-radius:2px;vertical-align:middle;background:linear-gradient(90deg,#eef2ff,#1f3bd6)"></span> darker = higher weight<br>blank cell = sector not held that month
+      </div>
+    </div>
+    <div id="${hostId}_plot" style="height:${H}px"></div>`;
+  Plotly.newPlot(hostId+"_plot", [{
+    type:"heatmap", x:sa.dates, y:ylab, z:z,
+    colorscale:[[0,"#ffffff"],[0.001,"#eef2ff"],[0.25,"#aebfff"],[0.6,"#5f7bff"],[1,"#1f3bd6"]],
+    zmin:0, zmax:35, xgap:1, ygap:2, showscale:false,
+    hovertemplate:"<b>%{y}</b><br>%{x|%b %Y}<br>%{z:.0f}% of book<extra></extra>"
+  }], {...LAY, height:H, margin:{l:150, r:52, t:6, b:26},
+      xaxis:{...LAY.xaxis, type:"date", fixedrange:true},
+      yaxis:{...LAY.yaxis, automargin:true, ticks:"", fixedrange:true},
+      annotations:anns}, PLOT);
+}
+
+// The full "Sector allocation" card (stat cards + donut + peak-bars + rotation heat-map),
+// shared by the Dynamic Allocator baskets AND the 12 main baskets. `prefix` namespaces the
+// chart container ids so the two views never collide.
+function sectorCardHTML(sa, prefix, label, capPct){
+  if(!sa || !sa.peak) return "";
+  const p = sa.peak, b = sa.biggest_stock;
+  return `<div class="card">
+    <h2>Sector allocation <span class="pill sec" style="font-size:10px">real backtest data</span></h2>
+    <div class="lead">Momentum picks <i>stocks</i>, not sectors — so here's where the money actually lands. All weights are % of the equity book${label?` (${label})`:""}.</div>
+    <div class="metrics">
+      ${metric("Peak in one sector", fmt(p.weight,0)+"%", p.sector+" · "+p.date, p.weight>=40?"down":(capPct?"up":""))}
+      ${metric("Typical top sector", fmt(sa.avg_top,0)+"%", "avg largest sector")}
+      ${metric("Sectors held", fmt(sa.avg_sectors,1), "avg spread, out of 11")}
+      ${metric("Biggest single stock", b.sym, fmt(b.weight,1)+"% · "+b.date)}
+    </div>
+    ${capPct
+      ? `<div class="disclaimer good"><span class="ic">🛡️</span><div><b>Sector-controlled.</b> A hard <b>${capPct}% cap</b> is applied after weighting, so no sector exceeds ${capPct}% of the book — overflow is redistributed to other sectors. Flip to <b>Uncapped</b> above to see momentum's raw ${fmt(p.weight,0)>=40?"~50%+":""} tilt.</div></div>`
+      : (p.weight>=40?`<div class="disclaimer"><span class="ic">⚠️</span><div><b>At its most concentrated, ${fmt(p.weight,0)}% of the equity book sat in ${p.sector}</b> (${p.date}). With no sector cap, momentum can let one sector dominate — switch to <b>Sector-controlled</b> above to hold this at ${25}%.</div></div>`:"")}
+
+    <div class="two" style="margin-top:14px">
+      <div>
+        <h3 class="mini">Where the money sits today</h3>
+        <div class="lead" style="margin-top:2px">The book's sector mix right now — small sectors grouped as “Other”.</div>
+        <div id="${prefix}donut" style="height:300px"></div>
+      </div>
+      <div>
+        <h3 class="mini">Most a single sector ever reached</h3>
+        <div class="lead" style="margin-top:2px">Peak weight each sector ever hit at one rebalance — hover for the date.</div>
+        <div id="${prefix}bars" style="height:300px"></div>
+      </div>
+    </div>
+
+    <div id="${prefix}rotate" style="margin-top:22px"></div>
+  </div>`;
+}
+
+function renderSectorCharts(sa, prefix){
+  if(!sa || !sa.sectors || !sa.sectors.length) return;
+  const last = sa.dates.length - 1;
+
+  // DONUT — today's sector mix, tiny slices grouped into "Other"
+  const cur = sa.sectors.map(sec=>({sec, w:sa.series[sec][last]})).filter(o=>o.w>0.05).sort((a,b)=>b.w-a.w);
+  const big = cur.filter(o=>o.w>=4), small = cur.filter(o=>o.w<4);
+  const dlab = big.map(o=>o.sec), dval = big.map(o=>+o.w.toFixed(1));
+  if(small.length){ dlab.push("Other"); dval.push(+small.reduce((s,o)=>s+o.w,0).toFixed(1)); }
+  Plotly.newPlot(prefix+"donut",[{
+    type:"pie", hole:0.58, labels:dlab.map(secname), values:dval, sort:false, direction:"clockwise",
+    marker:{colors:dlab.map(l=>l==="Other"?"#c0c6d4":seccol(l))},
+    textinfo:"percent", textfont:{size:11},
+    hovertemplate:"<b>%{label}</b><br>%{value}% of book<extra></extra>"
+  }],{...LAY, height:300, showlegend:true, legend:{orientation:"h", y:-0.02, font:{size:10}},
+      margin:{l:6,r:6,t:6,b:66},
+      annotations:[{text:"today", showarrow:false, font:{size:13, color:"#8a8fa6"}}]},PLOT);
+
+  // BARS — the most any single sector ever reached
+  const mb = sa.max_by_sector.slice().reverse();
+  Plotly.newPlot(prefix+"bars",[{
+    type:"bar", orientation:"h",
+    x: mb.map(x=>x.weight), y: mb.map(x=>secname(x.sector)),
+    marker:{color: mb.map(x=>seccol(x.sector))},
+    text: mb.map(x=>fmt(x.weight,0)+"%"), textposition:"auto",
+    customdata: mb.map(x=>x.date),
+    hovertemplate:"<b>%{y}</b><br>peaked at %{x:.1f}% on %{customdata}<extra></extra>"
+  }],{...LAY, height:300, margin:{l:128,r:16,t:6,b:26},
+      xaxis:{...LAY.xaxis, type:"linear", ticksuffix:"%", rangemode:"tozero"}, yaxis:{...LAY.yaxis, automargin:true}},PLOT);
+
+  // ROTATION — RupeeCase-style heat-map
+  renderSectorHeatmap(sa, prefix+"rotate");
+}
 
 let STOCKS = [], CUR = null, RANGE = 252, _price = 0, CURINDEX = "n50", CURUNI = "standard", CURCAD = "";
 const BASE = {n50:{standard:"vm_pe_only", pit:"vm_pit"}, n500:{standard:"vm500", pit:"vm500_pit"}};
@@ -162,6 +285,8 @@ async function renderBasket(){
         <td class="${cls(h.change_pct)}">${pct(h.change_pct)}</td></tr>`).join("")}</tbody></table>
     </div>
 
+    ${rbAll.sector?sectorCardHTML(rbAll.sector, "bsec", `${idxName} · ${cmp[bk].universe}`):""}
+
     <div class="card">
       <h2>Rebalance History <span style="color:var(--muted);font-weight:500;font-size:14px">· ${REB.length} rebalances</span></h2>
       <div class="lead">Every rebalance the basket is rebuilt — here's exactly what it bought and sold each time.</div>
@@ -183,6 +308,8 @@ async function renderBasket(){
   const paint = list => { $("#rebal").innerHTML = list.map(rebalRow).join(""); wireChips(); };
   paint(REB.slice(0,8));
   if($("#showall")) $("#showall").onclick = e => { paint(REB); e.target.remove(); };
+
+  renderSectorCharts(rbAll.sector, "bsec");
 
   // overlay Standard + Point-in-Time (this index & cadence) + Nifty; highlight selected universe
   const cs = (cmp[stdK]||{}).curve, cp = (cmp[pitK]||{}).curve;
@@ -381,10 +508,202 @@ async function renderCompareAll(){
   document.querySelectorAll("#compareall tbody tr[data-k]").forEach(r=>r.onclick=()=>{ setFromKey(r.dataset.k); switchView("basket"); renderBasket(); });
 }
 
+// ==================== EQUINEXT DYNAMIC (valuation-momentum + 3-asset switch) ====================
+let DYNIDX="n750", DYNWIN="rc", DYNCAP="", DYNPER="1Y", DYNV=null;
+const PORDER=["1M","3M","6M","1Y","3Y","5Y","Max"];
+const PLABEL={"1M":"1 month","3M":"3 months","6M":"6 months","1Y":"1 year","3Y":"3 years","5Y":"5 years","Max":"Since inception"};
+// Trailing-window returns for the current dynamic variant, in the toggle+cards style.
+function renderDynPeriod(){
+  const out=$("#dynperiodout"); if(!out||!DYNV) return;
+  const p=(DYNV.periods||[]).find(x=>x.label===PLABEL[DYNPER]);
+  if(!p){ out.innerHTML='<div class="lead" style="color:var(--muted);margin-top:12px">Not enough backtest history for this window.</div>'; return; }
+  const sgn=x=>(x>=0?"+":"")+fmt(x,1)+"%";
+  const exc=p.s-p.n500;
+  const note=p.ann
+    ? `<div class="lead" style="margin-top:10px">A year or more, so the cards show the <b>total</b> gain over the window; <b>annualised</b> (CAGR per year) it's basket <b class="up">${fmt(p.s_cagr,1)}%</b> vs Nifty 500 <b>${fmt(p.n500_cagr,1)}%</b> vs Nifty 50 <b>${fmt(p.n50_cagr,1)}%</b>.</div>`
+    : `<div class="lead" style="margin-top:10px">Window is under a year, so these are <b>total</b> returns for the period — not annualised (annualising a few months would be misleading).</div>`;
+  out.innerHTML=`
+    <div class="metrics" style="margin-top:12px">
+      ${metric("Basket return", sgn(p.s), `${p.from} → ${p.to}`, p.s>=0?"up":"down")}
+      ${metric("Nifty 500 return", sgn(p.n500), "same window", p.n500>=0?"up":"down")}
+      ${metric("Nifty 50 return", sgn(p.n50), "same window", p.n50>=0?"up":"down")}
+      ${metric("Excess vs Nifty 500", sgn(exc), "basket − index", exc>=0?"up":"down")}
+    </div>${note}`;
+}
+async function renderDynamic(){
+  const host=$("#dynamic");
+  const d=await cachedJSON("/api/dynamic");
+  if(!d||!d.ready){ host.innerHTML='<div class="loading">Backtest still computing — refresh in a minute.</div>'; return; }
+  const s=d.strategy, rc=d.rupeecase, V=d.variants;
+  let v=V[DYNIDX+DYNCAP+"_"+DYNWIN];
+  if(!v && DYNCAP){ DYNCAP=""; v=V[DYNIDX+"_"+DYNWIN]; }          // capped variant missing -> uncapped
+  if(!v){ DYNIDX="n750"; v=V["n750"+DYNCAP+"_"+DYNWIN] || V["n750_"+DYNWIN]; DYNCAP = V["n750"+DYNCAP+"_"+DYNWIN]?DYNCAP:""; }
+  const m=v.metrics;
+  const mrow=(label,mm,ae,cls="")=>`<tr class="${cls}"><td>${label}</td>
+    <td>${fmt(mm.cagr,1)}%</td><td>${fmt(mm.vol,1)}%</td><td>${fmt(mm.sharpe,2)}</td>
+    <td>${fmt(mm.sortino,2)}</td><td class="down">${fmt(mm.maxdd,1)}%</td>
+    <td>${fmt(mm.calmar,2)}</td><td>${ae!=null?fmt(ae,0)+"%":"—"}</td><td>₹${fmt(mm.final,0)}</td></tr>`;
+  const wins=[["RupeeCase window","rc","Nov 2022 → now · their exact period"],
+              ["Full window","full","Aug 2017 → now · incl. COVID crash"]];
+  let tbl="";
+  wins.forEach(([wname,wk,wsub])=>{
+    const b=V["n500_"+wk].bench;
+    tbl+=`<tr class="subrow"><td colspan="9" style="padding-top:14px"><b>${wname}</b> <span style="color:var(--muted);font-weight:500;font-size:12px">· ${wsub}</span></td></tr>`;
+    const DV=u=>V[u+DYNCAP+"_"+wk]||V[u+"_"+wk];              // cap-aware variant lookup
+    const capLbl=DYNCAP?' <span class="pill" style="background:#e7f6ef;color:#0a8f5f;font-size:9px">🛡️ 25%</span>':"";
+    tbl+=mrow("Nifty 50 index", b.nifty50, null);
+    tbl+=mrow("Nifty 500 index", b.nifty500, null);
+    tbl+=mrow("<b>Dynamic · Nifty 500</b>"+capLbl, DV("n500").metrics, DV("n500").metrics.avg_eq, "selrow");
+    tbl+=mrow("<b>Dynamic · Total Market</b>"+capLbl, DV("n750").metrics, DV("n750").metrics.avg_eq, "selrow");
+    if(DV("rc")) tbl+=mrow('<b>RupeeCase Stocks</b> <span class="pill sec" style="font-size:9.5px">their picks</span>'+capLbl, DV("rc").metrics, DV("rc").metrics.avg_eq, "selrow");
+    if(wk==="rc") tbl+=`<tr style="opacity:.7"><td>RupeeCase <span class="pill sec" style="font-size:9.5px">claimed</span></td>
+      <td>${rc.cagr}%</td><td>${rc.vol}%</td><td>${rc.sharpe}</td><td>${rc.sortino}</td>
+      <td class="down">${rc.maxdd}%</td><td>${rc.calmar}</td><td>—</td><td>₹${rc.final}</td></tr>`;
+  });
+  const step=st=>`<div class="step"><div class="top"><div class="num">${st.n}</div>
+    <div><div class="ttl">${st.title}</div><div class="role">${st.role}</div></div></div>
+    <div class="why">${st.why}</div><ul>${st.criteria.map(c=>`<li>${c}</li>`).join("")}</ul></div>`;
+  // Momentum-only baskets skip the valuation & earnings gates — show the accurate recipe.
+  const isMom=!!v.momentum_only;
+  const vsteps=(isMom ? s.steps.filter(st=>!/valuation gate|earnings-backed/i.test(st.title)) : s.steps)
+    .map((st,i)=>{ const o={...st,n:i+1};
+      if(isMom && /momentum score/i.test(st.title)){
+        o.role="Ranks (no filter first)";
+        o.why="Rank the WHOLE universe by trend strength and take the top 50, inverse-vol weighted. No valuation or earnings gate is applied before this — momentum alone decides.";
+      }
+      return o; });
+  const ddRow=r=>`<tr><td>${r.started}</td><td>${r.trough}</td><td>${r.recovered}</td>
+    <td class="down"><b>${fmt(r.max_dd,1)}%</b></td><td>${r.duration_days} days</td></tr>`;
+  const chips=(arr,cls)=>arr.map(x=>`<span class="tchip ${cls}">${x}</span>`).join("");
+  const rebRow=r=>{
+    const ch=(r.bought.length||r.sold.length)
+      ? `${r.bought.length?'<span class="tlabel">In</span>'+chips(r.bought,"buy"):""}${r.sold.length?'<span class="tlabel">Out</span>'+chips(r.sold,"sell"):""}`
+      : '<span style="color:var(--muted)">No change</span>';
+    return `<div class="rev"><div class="date">${r.date}</div><div class="changes">${ch}</div>
+      <div class="meta">${r.n} held · ${r.kept} kept · ${fmt(r.turnover,0)}% traded</div></div>`;
+  };
+  const holdRow=(h,i)=>`<tr><td style="color:var(--muted)">${i+1}</td><td><b>${h.sym}</b></td>
+    <td style="color:var(--sub)">${h.name}</td><td>${fmt(h.w_book,1)}%</td><td>${fmt(h.w_port,1)}%</td></tr>`;
+
+  host.innerHTML=`
+    <div class="hero"><div><h1>${s.name}</h1><div class="tag">${s.tagline}</div></div>
+      <div class="asof">${s.cadence} · real backtest data</div></div>
+
+    <div class="card" style="margin-top:14px">
+      <h2>Backtested results — dynamic monthly</h2>
+      <div class="lead">Valuation-momentum equity wrapped in a monthly 3-asset switch, on <b>two universes</b> across <b>two windows</b>. Index benchmarks and RupeeCase's claimed figures shown for reference.</div>
+      <table><thead><tr><th>Strategy</th><th>CAGR</th><th>Vol</th><th>Sharpe</th><th>Sortino</th><th>Max DD</th><th>Calmar</th><th>Avg Eq</th><th>₹100→</th></tr></thead>
+      <tbody>${tbl}</tbody></table>
+      <div class="gapnote" style="text-align:left;margin-top:14px">The <b>Full window</b> numbers (incl. the −38% COVID crash) are the trustworthy, crash-tested ones. RupeeCase's 45% is a <b>bull-only, small-cap-heavy</b> figure their backtest never stress-tested against a real bear market.</div>
+    </div>
+
+    <div class="toggles">
+      <div class="btoggle" id="dynidx">
+        <button data-i="n500" class="${DYNIDX==="n500"?"on":""}">Nifty 500<small>500 stocks</small></button>
+        <button data-i="n750" class="${DYNIDX==="n750"?"on":""}">Total Market<small>~750 stocks</small></button>
+        <button data-i="rc" class="${DYNIDX==="rc"?"on":""}">RupeeCase Stocks<small>their ~240</small></button>
+      </div>
+      <div class="btoggle" id="dynwin">
+        <button data-w="rc" class="${DYNWIN==="rc"?"on":""}">RupeeCase window<small>2022→now</small></button>
+        <button data-w="full" class="${DYNWIN==="full"?"on":""}">Full window<small>2017→now</small></button>
+      </div>
+      <div class="btoggle" id="dyncap">
+        <button data-c="" class="${DYNCAP===""?"on":""}">Uncapped<small>momentum's raw tilt</small></button>
+        <button data-c="cap" class="${DYNCAP==="cap"?"on":""}">Sector-controlled<small>max 25% / sector</small></button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>${v.label} ${v.sector_capped?`<span class="pill" style="background:#e7f6ef;color:#0a8f5f;font-size:10px;vertical-align:middle">🛡️ SECTOR-CONTROLLED · ${v.cap_pct}% cap</span>`:""} · ${DYNWIN==="rc"?"RupeeCase window":"Full window"} <span style="color:var(--muted);font-weight:500;font-size:14px">· ${v.start} → ${v.end}</span></h2>
+      ${v.momentum_only?`<div class="disclaimer"><span class="ic">⚠️</span><div><b>Momentum-only on RupeeCase's own published holdings</b> (no valuation gates). This universe is <b>survivorship-tilted</b> — it's the set their momentum eventually rode to winners — so treat the return as an <b>upper bound</b>, not a clean forward test.</div></div>`:""}
+      <div class="metrics">
+        ${metric("Return (CAGR)", fmt(m.cagr,1)+"%", `Nifty 500: ${fmt(v.bench.nifty500.cagr,1)}%`, "up")}
+        ${metric("Sharpe", fmt(m.sharpe,2), "return per unit of risk")}
+        ${metric("Sortino", fmt(m.sortino,2), "return per unit of downside")}
+        ${metric("Max Drawdown", fmt(m.maxdd,1)+"%", "worst peak-to-trough", "down")}
+        ${metric("Calmar", fmt(m.calmar,2), "return ÷ drawdown")}
+        ${metric("Avg equity", fmt(m.avg_eq,0)+"%", "dial exposure (35–100%)")}
+        ${metric("₹100 grew to", "₹"+fmt(m.final,0), `Nifty 500: ₹${fmt(v.bench.nifty500.final,0)}`)}
+      </div>
+      <div class="legend" style="margin-top:16px"><span><b style="background:${GREEN}"></b>Equinext Dynamic</span><span><b style="background:${GRAY}"></b>Nifty 500</span><span><b style="background:${VIOLET}"></b>Nifty 50</span></div>
+      <div id="dyncurve" style="height:320px"></div>
+    </div>
+
+    ${v.periods?`<div class="card">
+      <h2>Returns by period <span class="pill sec" style="font-size:10px">real backtest data</span></h2>
+      <div class="lead">The CAGR above covers the whole backtest. Pick a trailing window below to see how <b>${v.label}</b> did versus the Nifty indices over just that stretch — computed straight from the daily backtest curve.</div>
+      <div class="btoggle" id="dynperiod" style="margin-top:6px">${PORDER.map(c=>`<button data-p="${c}" class="${c===DYNPER?"on":""}">${c}</button>`).join("")}</div>
+      <div id="dynperiodout"></div>
+    </div>`:""}
+
+    ${v.current_holdings?`<div class="card">
+      <h2>Current holdings <span style="color:var(--muted);font-weight:500;font-size:14px">· as of ${v.current_holdings.asof}</span></h2>
+      <div class="lead">Where the money sits today under the monthly dial, then the stocks in the equity book right now (${v.label}), ranked by weight.</div>
+      <div class="metrics">
+        ${metric("Equity", fmt(v.current.eq,0)+"%", "in stocks now", "up")}
+        ${metric("Debt", fmt(v.current.debt,0)+"%", "liquid ~6.5%/yr")}
+        ${metric("Gold", fmt(v.current.gold,0)+"%", "GoldBees ETF")}
+        ${metric("Stocks held", v.current_holdings.stocks.length, "in the equity book")}
+      </div>
+      <div style="max-height:460px;overflow:auto;margin-top:14px">
+      <table><thead><tr><th>#</th><th>Stock</th><th>Name</th><th>% of book</th><th>% of portfolio</th></tr></thead>
+      <tbody>${v.current_holdings.stocks.map(holdRow).join("")}</tbody></table>
+      </div>
+      <div class="gapnote" style="text-align:left;margin-top:12px"><b>% of book</b> = weight inside the ≤50-stock equity sleeve (sums to 100%). <b>% of portfolio</b> = effective weight after the dial — equity is ${fmt(v.current.eq,0)}% of the whole portfolio today, the rest sits in debt + gold.</div>
+    </div>`:""}
+
+    ${sectorCardHTML(v.sector, "sec", v.label, v.cap_pct)}
+
+    <div class="card">
+      <h2>Worst 5 drawdowns <span class="pill sec" style="font-size:10px">real backtest data</span></h2>
+      <div class="lead">The five deepest peak-to-trough falls of this basket over ${DYNWIN==="rc"?"the RupeeCase window":"the full window"} — measured on the daily equity curve.</div>
+      <table><thead><tr><th>Started (peak)</th><th>Trough</th><th>Recovered</th><th>Max Drawdown</th><th>Duration</th></tr></thead>
+      <tbody>${v.drawdowns.map(ddRow).join("")}</tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>How this basket is built</h2>
+      ${isMom
+        ? `<div class="disclaimer"><span class="ic">⚠️</span><div><b>Momentum only — no valuation or earnings gates.</b> This basket ranks purely by momentum and skips the P/E-froth and earnings-backed filters used by the valuation-momentum baskets. Steps below reflect what this basket actually does.</div></div>`
+        : `<div class="lead">Full <b>valuation-momentum</b> recipe: momentum <b>ranks</b>, valuation & earnings <b>gate</b> out the risky names — then the 3-asset dial.</div>`}
+      <div class="lead">Weighting: ${s.weighting}</div>
+      ${v.sector_capped?`<div class="lead">🛡️ <b>Sector cap:</b> after inverse-vol weighting, a hard <b>${v.cap_pct}% per-sector cap</b> is applied — any sector over the limit is trimmed and the overflow is redistributed to sectors with room, so no single sector runs the book. Stock selection is unchanged; only the sizing.</div>`:""}
+      <div class="steps">${vsteps.map(step).join("")}</div>
+    </div>
+
+    ${v.rebalances?`<div class="card">
+      <h2>Rebalance History <span style="color:var(--muted);font-weight:500;font-size:14px">· ${v.rebalances.length} monthly rebalances</span></h2>
+      <div class="lead">Every month the equity book is re-ranked by momentum from the <b>${v.label}</b> universe — here's exactly what it bought and sold each time. Newest first.</div>
+      <div class="rebal" style="max-height:540px;overflow:auto">${v.rebalances.map(rebRow).join("")}</div>
+    </div>`:""}`;
+
+  const cs=v.curve;
+  const tr=[{x:cs.strategy.dates,y:cs.strategy.values,type:"scatter",mode:"lines",line:{color:GREEN,width:2.8},name:"Equinext Dynamic"},
+    {x:cs.nifty500.dates,y:cs.nifty500.values,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:"Nifty 500"},
+    {x:cs.nifty50.dates,y:cs.nifty50.values,type:"scatter",mode:"lines",line:{color:VIOLET,width:1.2},name:"Nifty 50"}];
+  Plotly.newPlot("dyncurve",tr,{...LAY,height:320,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
+
+  renderSectorCharts(v.sector, "sec");
+
+  DYNV=v;
+  document.querySelectorAll("#dynperiod button").forEach(b=>b.onclick=()=>{
+    DYNPER=b.dataset.p;
+    document.querySelectorAll("#dynperiod button").forEach(x=>x.classList.toggle("on", x===b));
+    renderDynPeriod();
+  });
+  renderDynPeriod();
+
+  document.querySelectorAll("#dynidx button").forEach(b=>b.onclick=()=>{ DYNIDX=b.dataset.i; renderDynamic(); });
+  document.querySelectorAll("#dynwin button").forEach(b=>b.onclick=()=>{ DYNWIN=b.dataset.w; renderDynamic(); });
+  document.querySelectorAll("#dyncap button").forEach(b=>b.onclick=()=>{ DYNCAP=b.dataset.c; renderDynamic(); });
+}
+
 // nav
 function switchView(v){
   document.querySelectorAll(".navtab").forEach(b=>b.classList.toggle("active",b.dataset.view===v));
-  $("#basket-view").hidden=v!=="basket"; $("#stocks-view").hidden=v!=="stocks"; $("#compare-view").hidden=v!=="compare";
+  $("#basket-view").hidden=v!=="basket"; $("#stocks-view").hidden=v!=="stocks";
+  $("#compare-view").hidden=v!=="compare"; $("#dynamic-view").hidden=v!=="dynamic";
   if(v==="compare") renderCompareAll();
+  if(v==="dynamic") renderDynamic();
 }
 boot();

@@ -39,6 +39,74 @@ LOOKBACK_DAYS = 800       # ~2y+ of price history for momentum/vol
 MIN_VAL_OBS = 60          # valuation rows before froth/decomp gates apply
 
 
+# --------------------------------------------------------------------------- #
+# Hard sector / stock weight caps (capped-index waterfall)
+# --------------------------------------------------------------------------- #
+def _waterfall(w0: dict, group_of, cap: float, tol: float = 1e-12, max_iter: int = 200) -> dict:
+    """Cap each GROUP's total weight at `cap` by iterative proportional redistribution
+    (the 'capped index' method). Overflow from an over-cap group is pushed to the
+    under-cap groups in proportion to their original weight; within a group, members keep
+    their relative proportions. Caps the single most-over group each pass (monotone, so it
+    always terminates). If the cap is infeasible (cap x #groups < 1) it relaxes to an equal
+    split. Returns weights summing to 1."""
+    orig = {s: float(x) for s, x in w0.items()}
+    groups: dict = {}
+    for s in orig:
+        groups.setdefault(group_of(s) or "Unknown", []).append(s)
+    G = list(groups)
+    capped: set = set()
+    for _ in range(max_iter):
+        unc = [g for g in G if g not in capped]
+        if not unc:
+            break
+        remaining = 1.0 - cap * len(capped)
+        denom = sum(orig[s] for g in unc for s in groups[g])
+        if denom <= tol:
+            break
+        worst, worst_val = None, cap + tol
+        for g in unc:
+            g_tot = remaining * sum(orig[s] for s in groups[g]) / denom
+            if g_tot > worst_val:
+                worst, worst_val = g, g_tot
+        if worst is None:
+            break                                   # no uncapped group exceeds the cap
+        capped.add(worst)                           # freeze the most-over group, recompute
+    remaining = 1.0 - cap * len(capped)
+    unc = [g for g in G if g not in capped]
+    denom = sum(orig[s] for g in unc for s in groups[g]) if unc else 0.0
+    out: dict = {}
+    for g in G:
+        g_orig = sum(orig[s] for s in groups[g])
+        g_tot = cap if g in capped else (remaining * g_orig / denom if denom > tol else 0.0)
+        for s in groups[g]:
+            out[s] = g_tot * (orig[s] / g_orig) if g_orig > tol else g_tot / len(groups[g])
+    tot = sum(out.values())
+    return {s: x / tot for s, x in out.items()} if tot > tol else dict(w0)
+
+
+def cap_weights(weights: dict, sector_of, sector_cap=None, stock_cap=None, max_outer: int = 25) -> dict:
+    """Apply a hard sector-weight cap and/or per-stock cap to inverse-vol weights, by
+    alternating the two waterfalls until both hold (or `max_outer`). Weights sum to 1 and
+    within-sector inverse-vol order is preserved. Selection is untouched — only sizing."""
+    if not weights:
+        return weights
+    t = sum(weights.values())
+    if t <= 0:
+        return weights
+    w = {s: float(x) / t for s, x in weights.items()}
+    if sector_cap is None and stock_cap is None:
+        return w
+    for _ in range(max_outer):
+        prev = dict(w)
+        if sector_cap is not None:
+            w = _waterfall(w, sector_of, sector_cap)
+        if stock_cap is not None:
+            w = _waterfall(w, lambda s: s, stock_cap)
+        if max(abs(w[s] - prev[s]) for s in w) < 1e-7:
+            break
+    return w
+
+
 class ValuationMomentumBasket(Basket):
     name = "valuation_momentum"
     USE_GATES = True          # False -> momentum-only ablation (see MomentumOnlyBasket)
@@ -46,6 +114,12 @@ class ValuationMomentumBasket(Basket):
     GROWTH_EXEMPT = None       # None = blunt froth gate. e.g. 0.20 -> a frothy stock is
                                # EXCUSED if its earnings grow >= 20%/yr (growth-adjusted gate)
     FROTH_MAX = FROTH_MAX      # drop names richer than this own-history percentile (sweepable)
+    MAX_PER_SECTOR = None      # None = no sector cap. e.g. 3 -> at most 3 names per sector in
+                               # the held N_HOLD, so momentum can't pile the book into one sector.
+    N_HOLD = N_HOLD            # top-N by momentum held each rebalance (overridable per basket)
+    SECTOR_WEIGHT_CAP = None   # None = off. e.g. 0.25 -> no sector may exceed 25% of the book
+                               # (hard weight cap via waterfall; keeps the names, tempers sizing).
+    MAX_STOCK_WEIGHT = None    # None = off. e.g. 0.08 -> no single stock may exceed 8% of the book.
 
     def _universe(self, as_of, ctx):
         """Investable universe for this rebalance. Override for a different universe
@@ -116,14 +190,41 @@ class ValuationMomentumBasket(Basket):
         else:
             pool = df                                       # ablation: momentum-only, no gates
 
-        top = pool.sort_values("momentum", ascending=False).head(N_HOLD)
+        pool_sorted = pool.sort_values("momentum", ascending=False)
+        top = self._pick_top(pool_sorted, ctx)
         inv = 1.0 / top["vol"]                                   # inverse-vol weights
         weights = dict(zip(top["symbol"], inv / inv.sum()))
+        if self.SECTOR_WEIGHT_CAP is not None or self.MAX_STOCK_WEIGHT is not None:
+            weights = cap_weights(weights, lambda s: ctx.sector(s),
+                                  self.SECTOR_WEIGHT_CAP, self.MAX_STOCK_WEIGHT)
         scores = dict(zip(top["symbol"], top["momentum"]))
 
         sel = Selection(as_of=as_of.date(), weights=weights, scores=scores)
         sel.validate()
         return sel
+
+    def _pick_top(self, pool_sorted, ctx):
+        """Take the top N_HOLD by momentum. If MAX_PER_SECTOR is set, walk down the
+        momentum ranking and skip a name whose sector is already full — so no single
+        sector can dominate the book. If the cap starves us below N_HOLD (too few
+        sectors survived the gates), top up with the next-best momentum names."""
+        if self.MAX_PER_SECTOR is None:
+            return pool_sorted.head(self.N_HOLD)
+        picked, sec_count = [], {}
+        for sym in pool_sorted["symbol"]:
+            sec = ctx.sector(sym) or "Unknown"
+            if sec_count.get(sec, 0) < self.MAX_PER_SECTOR:
+                picked.append(sym)
+                sec_count[sec] = sec_count.get(sec, 0) + 1
+            if len(picked) >= self.N_HOLD:
+                break
+        if len(picked) < self.N_HOLD:                  # cap starved us -> top up by momentum
+            for sym in pool_sorted["symbol"]:
+                if sym not in picked:
+                    picked.append(sym)
+                    if len(picked) >= self.N_HOLD:
+                        break
+        return pool_sorted[pool_sorted["symbol"].isin(picked)]
 
 
 class MomentumOnlyBasket(ValuationMomentumBasket):
@@ -179,6 +280,60 @@ class VM500PIT(ValuationMomentumPEOnly):
         # Market pool (~750) — so relegated-but-still-listed ex-members are IN during
         # the years they were large. (Delisted losers still can't be included.)
         return pit_universe(as_of, pool=_pool("n500_pool"), top_n=500)
+
+
+class VM500Standard50(VM500Standard):
+    """Standard Nifty 500 equity engine holding up to 50 momentum names (vs the
+    usual 15). Equity sleeve for the fixed-weight 3-asset static allocator."""
+    name = "vm500_50"
+    N_HOLD = 50
+
+
+class VMTotalMarket50(VM500Standard50):
+    """Equity engine on the FULL Nifty Total Market (~750 stocks we have data for),
+    up to 50 momentum names. Same valuation-momentum funnel; only the universe is the
+    whole Total-Market pool instead of the Nifty 500."""
+    name = "vmtm_50"
+
+    def _universe(self, as_of, ctx):
+        from equinext.universe import standard_universe, _pool
+        return standard_universe(as_of, _pool("n500_pool"))
+
+
+class VMTotalMarketMomOnly50(VMTotalMarket50):
+    """Momentum-ONLY equity engine on the Nifty Total Market (~750), up to 50 names.
+    Identical to VMTotalMarket50 but with the valuation (froth) and earnings-backed
+    gates DISABLED — pure momentum ranking, like RupeeCase's equity sleeve. Used to
+    measure exactly what our risk-control gates cost vs. an ungated momentum book."""
+    name = "vmtm_mom50"
+    USE_GATES = False
+
+
+class VMRupeeCaseUniverse(VMTotalMarketMomOnly50):
+    """Momentum-only on RupeeCase's OWN published equity-holdings universe (~240 of
+    their actual rebalance stocks that we have prices for). Pure momentum, top 50,
+    inverse-vol — 'use their stocks, ranked by momentum'. NOTE: survivorship-tilted,
+    since this universe IS the set their momentum eventually rode; return is an
+    upper-biased estimate, not a clean forward test."""
+    name = "vm_rc_uni"
+
+    def _universe(self, as_of, ctx):
+        from equinext.universe import standard_universe, _pool
+        return standard_universe(as_of, _pool("rupeecase"))
+
+
+class VMSectorCapPIT(ValuationMomentumPIT):
+    """Equity engine for Equinext Dynamic (Nifty 50). Identical to vm_pit
+    (survivorship-free, P/E froth + earnings gate, momentum, inverse-vol) but with a
+    max-3-names-per-sector cap so momentum can't concentrate the book in one sector."""
+    name = "vm_cap"
+    MAX_PER_SECTOR = 3
+
+
+class VM500SectorCapPIT(VM500PIT):
+    """Equity engine for Equinext Dynamic (Nifty 500). vm500_pit + max-3/sector cap."""
+    name = "vm500_cap"
+    MAX_PER_SECTOR = 3
 
 
 class ValuationMomentumGrowthAdj(ValuationMomentumBasket):

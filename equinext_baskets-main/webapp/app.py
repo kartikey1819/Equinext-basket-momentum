@@ -16,6 +16,7 @@ Endpoints:
 """
 from __future__ import annotations
 import sqlite3
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -26,6 +27,9 @@ from flask import Flask, jsonify, render_template, abort, request
 _REPO = Path(__file__).resolve().parents[1]
 SOURCE_DB = _REPO.parent / "nifty500_hrp.db"
 PROJECT_DB = _REPO / "equinext.db"
+
+sys.path.insert(0, str(_REPO))
+from scripts.dynamic_common import sector_analysis   # noqa: E402  (shared sector-rotation builder)
 
 # 12 baskets = 2 indices x 2 universes x 3 rebalance cadences (same strategy throughout).
 _BASES = {
@@ -346,17 +350,22 @@ def rebalances():
                      con, params=(bk,))
     con.close()
     if df.empty:
-        return jsonify({"rebalances": []})
-    out, prev = [], {}
+        return jsonify({"rebalances": [], "sector": None})
+    secs = _securities()
+    sector_map = {s: (secs.loc[s, "sector"] if s in secs.index and pd.notna(secs.loc[s, "sector"]) else None)
+                  for s in df["symbol"].unique()}
+    out, recs, prev = [], [], {}
     for d in sorted(df["as_of"].unique()):
-        cur = dict(zip(df[df.as_of == d].symbol, df[df.as_of == d].weight))
+        sub = df[df.as_of == d]
+        cur = dict(zip(sub.symbol, sub.weight))
+        recs.append({"date": str(d), "holdings": [{"sym": s, "weight": w * 100.0} for s, w in cur.items()]})
         cs, ps = set(cur), set(prev)
         turnover = sum(abs(cur.get(s, 0) - prev.get(s, 0)) for s in cs | ps) * 100
         out.append({"date": d, "bought": sorted(cs - ps), "sold": sorted(ps - cs),
                     "kept": len(cs & ps), "n": len(cur), "turnover": round(turnover, 1)})
         prev = cur
     out.reverse()   # most recent first
-    return jsonify({"rebalances": out})
+    return jsonify({"rebalances": out, "sector": sector_analysis(recs, sector_map)})
 
 
 @app.route("/api/strategy")
@@ -414,6 +423,20 @@ def strategy():
             ],
         },
     })
+
+
+@app.route("/api/dynamic")
+def dynamic():
+    """Equinext Dynamic (valuation-momentum + monthly 3-asset switch) precomputed
+    results: metrics, curves, and real worst-5 drawdowns for Nifty 500 & Total Market
+    over the RupeeCase and full windows. Served from build_dynamic_page.py's JSON."""
+    import json
+    f = _REPO / "webapp" / "dynamic_results.json"
+    if not f.exists():
+        return jsonify({"ready": False})
+    data = json.loads(f.read_text(encoding="utf-8"))
+    data["ready"] = True
+    return jsonify(data)
 
 
 if __name__ == "__main__":

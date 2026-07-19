@@ -49,8 +49,25 @@ def base_symbols() -> tuple[str, ...]:
     return tuple(_mapping()["Symbol"].dropna().unique())
 
 
+@functools.lru_cache(maxsize=1)
+def _securities_sectors() -> dict:
+    """Sector per symbol from the equinext.db `securities` table — broader and the SAME
+    taxonomy the web app charts use. Preferred over the Nifty-500-only mapping CSV so the
+    Total Market (~750) names aren't all dumped into 'Unknown'."""
+    try:
+        con = sqlite3.connect(str(_PROJECT_DB))
+        df = pd.read_sql("SELECT symbol, sector FROM securities", con)
+        con.close()
+        return {r.symbol: str(r.sector) for r in df.itertuples() if pd.notna(r.sector)}
+    except Exception:
+        return {}
+
+
 def sector_of(symbol: str) -> str | None:
-    m = _mapping()
+    sec = _securities_sectors().get(symbol)      # complete, web-consistent source first
+    if sec:
+        return sec
+    m = _mapping()                               # fall back to the Nifty 500 mapping CSV
     row = m[m["Symbol"] == symbol]
     return None if row.empty else str(row.iloc[0]["Sector"])
 

@@ -13,6 +13,7 @@
     <div class="navtabs">
       <button class="navtab active" data-view="basket">Basket</button>
       <button class="navtab" data-view="compare">Compare All</button>
+      <button class="navtab" data-view="dynamic">Dynamic Allocator</button>
       <button class="navtab" data-view="stocks">Stocks</button>
     </div>
     <div class="search"><input id="search" placeholder="Search a stock…" autocomplete="off"></div>
@@ -26,6 +27,11 @@
   <!-- COMPARE ALL 12 -->
   <div id="compare-view" class="view" hidden>
     <div class="wrap" id="compareall"><div class="loading">Loading comparison…</div></div>
+  </div>
+
+  <!-- EQUINEXT DYNAMIC (valuation-momentum + 3-asset switch) -->
+  <div id="dynamic-view" class="view" hidden>
+    <div class="wrap" id="dynamic"><div class="loading">Loading dynamic allocator…</div></div>
   </div>
 
   <!-- STOCKS -->
