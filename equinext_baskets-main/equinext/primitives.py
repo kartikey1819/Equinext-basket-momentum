@@ -171,3 +171,39 @@ def trend_above_ma(close: pd.Series, end, ma: int = 200) -> bool:
     if len(s) < ma:
         return False
     return bool(s.iloc[-1] > s.rolling(ma).mean().iloc[-1])
+
+
+def rsi_wilder(close: pd.Series, end, window: int = 30) -> float:
+    """Wilder's RSI (0-100) over `window` periods, latest value on/before `end`.
+    >70 overbought, >80 strongly overbought / parabolic. Used ONLY to exclude
+    blow-off tops (a technical froth complement) — never to rank."""
+    end = pd.Timestamp(end)
+    s = close[close.index <= end].dropna()
+    if len(s) < window + 1:
+        return np.nan
+    delta = s.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    ag = gain.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean().iloc[-1]
+    al = loss.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean().iloc[-1]
+    if np.isnan(ag) or np.isnan(al):
+        return np.nan
+    if al == 0:
+        return 100.0
+    rs = ag / al
+    return float(100.0 - 100.0 / (1.0 + rs))
+
+
+def multi_tf_aligned(close: pd.Series, end, months=(3, 6, 12), min_pos: int = 3) -> bool:
+    """Multi-timeframe momentum confirmation: are at least `min_pos` of the trailing
+    3/6/12-month returns positive? Filters out names whose trend is already rolling over."""
+    end = pd.Timestamp(end)
+    s = close[close.index <= end].dropna()
+    if s.empty:
+        return False
+    pos = 0
+    for m in months:
+        r = return_over(s, end, m)
+        if np.isfinite(r) and r > 0:
+            pos += 1
+    return pos >= min_pos

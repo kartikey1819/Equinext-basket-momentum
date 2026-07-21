@@ -215,6 +215,30 @@ def switch_asset_split(index_name: str, days, rebalance="ME",
             "gold": round((0.0 if b_eq else wB) * 100, 1)}
 
 
+def switch_avg_split(index_name: str, days, rebalance="ME",
+                     core=0.35, wA=0.40, wB=0.25, lookback=63) -> dict:
+    """AVERAGE target asset split (eq/debt/gold, %) of the dual-momentum switch across every
+    rebalance over `days` — how the dial sat on average. Same signal as run_switch."""
+    days = pd.DatetimeIndex(days)
+    idx = prices.load_benchmark(index_name, days[0] - pd.Timedelta(days=320), days[-1])
+    gc = gold_close()
+    eq_mom = idx / idx.shift(lookback) - 1
+    gold_mom = gc / gc.shift(lookback) - 1
+    debt_mom = (1 + DEBT_YIELD) ** (lookback / 252) - 1
+    rebs = sorted(set([days[0]] + list(_rebalance_dates(days, rebalance))))
+    eqs, debts, golds = [], [], []
+    for d in rebs:
+        em, gm = eq_mom.asof(d), gold_mom.asof(d)
+        em = float(em) if pd.notna(em) else 0.0
+        gm = float(gm) if pd.notna(gm) else 0.0
+        a_eq, b_eq = em > debt_mom, em > gm
+        eqs.append(core + (wA if a_eq else 0.0) + (wB if b_eq else 0.0))
+        debts.append(0.0 if a_eq else wA)
+        golds.append(0.0 if b_eq else wB)
+    n = len(rebs) or 1
+    return {"eq": sum(eqs) / n * 100, "debt": sum(debts) / n * 100, "gold": sum(golds) / n * 100}
+
+
 def worst_drawdowns(equity: pd.Series, n: int = 5) -> list[dict]:
     """Top-n worst peak-to-trough drawdown EPISODES from a daily equity curve.
     Each: started (peak date), recovered (back-to-peak date or 'ongoing'), trough

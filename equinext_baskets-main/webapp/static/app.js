@@ -79,6 +79,7 @@ function sectorCardHTML(sa, prefix, label, capPct){
       ${metric("Sectors held", fmt(sa.avg_sectors,1), "avg spread, out of 11")}
       ${metric("Biggest single stock", b.sym, fmt(b.weight,1)+"% · "+b.date)}
     </div>
+    ${sa.infeasible_rebalances>0?`<div class="gapnote" style="text-align:left;margin-top:6px;font-size:11px">The 8% stock cap holds at every rebalance where it's mathematically achievable. At <b>${sa.infeasible_rebalances}</b> rebalance${sa.infeasible_rebalances>1?"s":""} the book was too concentrated (a couple of big sectors + single-stock sectors) for 8% to be possible — there the <b>25% sector cap was kept</b> and a few names ran slightly above 8%.</div>`:""}
     ${capPct
       ? `<div class="disclaimer good"><span class="ic">🛡️</span><div><b>Sector-controlled.</b> A hard <b>${capPct}% cap</b> is applied after weighting, so no sector exceeds ${capPct}% of the book — overflow is redistributed to other sectors. Flip to <b>Uncapped</b> above to see momentum's raw ${fmt(p.weight,0)>=40?"~50%+":""} tilt.</div></div>`
       : (p.weight>=40?`<div class="disclaimer"><span class="ic">⚠️</span><div><b>At its most concentrated, ${fmt(p.weight,0)}% of the equity book sat in ${p.sector}</b> (${p.date}). With no sector cap, momentum can let one sector dominate — switch to <b>Sector-controlled</b> above to hold this at ${25}%.</div></div>`:"")}
@@ -509,7 +510,10 @@ async function renderCompareAll(){
 }
 
 // ==================== EQUINEXT DYNAMIC (valuation-momentum + 3-asset switch) ====================
-let DYNIDX="n750", DYNWIN="rc", DYNCAP="", DYNPER="1Y", DYNV=null;
+let DYNIDX="n750", DYNWIN="rc", DYNCAP="", DYNSTRAT="", DYNPER="1Y", DYNV=null;
+// Resolve the variant key for a universe under the current strategy/cap toggles.
+// DYNSTRAT is "" (base), "v2" (multi-layer) or "v2c" (Mode C).
+const dynKey = (u, wk) => DYNSTRAT ? (u+DYNSTRAT+"_"+wk) : (u+DYNCAP+"_"+wk);
 const PORDER=["1M","3M","6M","1Y","3Y","5Y","Max"];
 const PLABEL={"1M":"1 month","3M":"3 months","6M":"6 months","1Y":"1 year","3Y":"3 years","5Y":"5 years","Max":"Since inception"};
 // Trailing-window returns for the current dynamic variant, in the toggle+cards style.
@@ -535,9 +539,10 @@ async function renderDynamic(){
   const d=await cachedJSON("/api/dynamic");
   if(!d||!d.ready){ host.innerHTML='<div class="loading">Backtest still computing — refresh in a minute.</div>'; return; }
   const s=d.strategy, rc=d.rupeecase, V=d.variants;
-  let v=V[DYNIDX+DYNCAP+"_"+DYNWIN];
-  if(!v && DYNCAP){ DYNCAP=""; v=V[DYNIDX+"_"+DYNWIN]; }          // capped variant missing -> uncapped
-  if(!v){ DYNIDX="n750"; v=V["n750"+DYNCAP+"_"+DYNWIN] || V["n750_"+DYNWIN]; DYNCAP = V["n750"+DYNCAP+"_"+DYNWIN]?DYNCAP:""; }
+  let v=V[dynKey(DYNIDX, DYNWIN)];
+  if(!v && DYNSTRAT){ DYNSTRAT=""; v=V[dynKey(DYNIDX, DYNWIN)]; }          // no V2/Mode C here -> base
+  if(!v && DYNCAP){ DYNCAP=""; v=V[DYNIDX+"_"+DYNWIN]; }                    // capped missing -> uncapped
+  if(!v){ DYNIDX="n750"; v=V[dynKey("n750", DYNWIN)] || V["n750_"+DYNWIN]; }
   const m=v.metrics;
   const mrow=(label,mm,ae,cls="")=>`<tr class="${cls}"><td>${label}</td>
     <td>${fmt(mm.cagr,1)}%</td><td>${fmt(mm.vol,1)}%</td><td>${fmt(mm.sharpe,2)}</td>
@@ -549,13 +554,15 @@ async function renderDynamic(){
   wins.forEach(([wname,wk,wsub])=>{
     const b=V["n500_"+wk].bench;
     tbl+=`<tr class="subrow"><td colspan="9" style="padding-top:14px"><b>${wname}</b> <span style="color:var(--muted);font-weight:500;font-size:12px">· ${wsub}</span></td></tr>`;
-    const DV=u=>V[u+DYNCAP+"_"+wk]||V[u+"_"+wk];              // cap-aware variant lookup
-    const capLbl=DYNCAP?' <span class="pill" style="background:#e7f6ef;color:#0a8f5f;font-size:9px">🛡️ 25%</span>':"";
+    const DV=u=>V[dynKey(u,wk)]||V[u+"_"+wk];                 // strategy + cap aware lookup
+    const tag = DYNSTRAT==="v2c" ? ' <span class="pill" style="background:#fdeefb;color:#b23aa0;font-size:9px">🧭 Mode C</span>'
+              : DYNSTRAT==="v2" ? ' <span class="pill" style="background:#eef0ff;color:#4a5ad8;font-size:9px">🧪 V2</span>'
+              : DYNCAP ? ' <span class="pill" style="background:#e7f6ef;color:#0a8f5f;font-size:9px">🛡️ 25%</span>' : "";
     tbl+=mrow("Nifty 50 index", b.nifty50, null);
     tbl+=mrow("Nifty 500 index", b.nifty500, null);
-    tbl+=mrow("<b>Dynamic · Nifty 500</b>"+capLbl, DV("n500").metrics, DV("n500").metrics.avg_eq, "selrow");
-    tbl+=mrow("<b>Dynamic · Total Market</b>"+capLbl, DV("n750").metrics, DV("n750").metrics.avg_eq, "selrow");
-    if(DV("rc")) tbl+=mrow('<b>RupeeCase Stocks</b> <span class="pill sec" style="font-size:9.5px">their picks</span>'+capLbl, DV("rc").metrics, DV("rc").metrics.avg_eq, "selrow");
+    tbl+=mrow("<b>Dynamic · Nifty 500</b>"+tag, DV("n500").metrics, DV("n500").metrics.avg_eq, "selrow");
+    tbl+=mrow("<b>Dynamic · Total Market</b>"+tag, DV("n750").metrics, DV("n750").metrics.avg_eq, "selrow");
+    if(DV("rc")) tbl+=mrow('<b>RupeeCase Stocks</b> <span class="pill sec" style="font-size:9.5px">their picks</span>'+tag, DV("rc").metrics, DV("rc").metrics.avg_eq, "selrow");
     if(wk==="rc") tbl+=`<tr style="opacity:.7"><td>RupeeCase <span class="pill sec" style="font-size:9.5px">claimed</span></td>
       <td>${rc.cagr}%</td><td>${rc.vol}%</td><td>${rc.sharpe}</td><td>${rc.sortino}</td>
       <td class="down">${rc.maxdd}%</td><td>${rc.calmar}</td><td>—</td><td>₹${rc.final}</td></tr>`;
@@ -572,6 +579,17 @@ async function renderDynamic(){
         o.why="Rank the WHOLE universe by trend strength and take the top 50, inverse-vol weighted. No valuation or earnings gate is applied before this — momentum alone decides.";
       }
       return o; });
+  // V2 / Mode C get their own accurate build recipe (the base steps don't describe the tiers/gates).
+  const v2info = v.strategy_v2 ? [
+    {n:1, title:"Universe", role:"Eligibility", why:`Start from ${v.label.replace(/ · (V2|Mode C)$/,"")}, liquid & free-float-eligible names.${v.momentum_only?" (Momentum-only — no valuation history for these names.)":""}`, criteria:["Liquidity & free-float gates"]},
+    {n:2, title:"Cap-tiers", role:"Size split", why:"Split the universe by market-cap rank into Large (top 100), Mid (101–250) and Small (251–500).", criteria:["Large / Mid / Small buckets"]},
+    {n:3, title:"Stock selection · per tier", role:"Rank + gate", why:`Inside each tier: rank by momentum (12-1, 52w-high, volume), then drop ${v.momentum_only?"":"frothy (P/E), non-earnings-backed, "}${v.no_dma?"":"below-200-DMA, "}rolling-over (3/6/12-mo) and blow-off-top (RSI(30)>80) names. Take top-N, inverse-vol weighted.`, criteria:[...(v.momentum_only?[]:["P/E froth + earnings gate"]),...(v.no_dma?[]:["200-DMA trend gate"]),"Multi-timeframe momentum","RSI(30)>80 exclude","Inverse-vol weighting"]},
+    v.mode_c
+      ? {n:4, title:"Tier allocation · Mode C", role:"Fixed anchor + rotation", why:`A FIXED ${v.anchor_pct||40}% large-cap anchor stays put; the rest rotates to whichever of mid- or small-cap has stronger 6-month momentum.`, criteria:[`Large-cap fixed at ${v.anchor_pct||40}%`,"Satellite → mid or small by relative momentum"]}
+      : {n:4, title:"Tier allocation · regime dial", role:"Size risk-switch", why:"Scale the size mix by market regime: risk-on → tilt to mid/small; neutral → mostly large; risk-off → 100% large-cap.", criteria:["Risk-on 45/35/20","Neutral 70/20/10","Risk-off 100/0/0"]},
+    {n:5, title:"Risk caps", role:"Concentration control", why:"On the combined book: no sector above 25%, no single stock above 8% (waterfall redistribution).", criteria:["25% sector cap","8% stock cap"]},
+    {n:6, title:"3-Asset dial", role:"Risk dial", why:"Wrap the equity book in the dynamic switch — a 35% equity core, a 40% equity↔debt sleeve and a 25% equity↔gold sleeve by 3-mo momentum. Equity floats 35–100%.", criteria:["35% equity core","40% eq↔debt · 25% eq↔gold","Debt ~6.5%/yr · Gold = GoldBees"]},
+  ] : null;
   const ddRow=r=>`<tr><td>${r.started}</td><td>${r.trough}</td><td>${r.recovered}</td>
     <td class="down"><b>${fmt(r.max_dd,1)}%</b></td><td>${r.duration_days} days</td></tr>`;
   const chips=(arr,cls)=>arr.map(x=>`<span class="tchip ${cls}">${x}</span>`).join("");
@@ -603,6 +621,11 @@ async function renderDynamic(){
         <button data-i="n750" class="${DYNIDX==="n750"?"on":""}">Total Market<small>~750 stocks</small></button>
         <button data-i="rc" class="${DYNIDX==="rc"?"on":""}">RupeeCase Stocks<small>their ~240</small></button>
       </div>
+      <div class="btoggle" id="dynstrat">
+        <button data-s="" class="${DYNSTRAT===""?"on":""}">Base strategy<small>momentum + dial</small></button>
+        <button data-s="v2" class="${DYNSTRAT==="v2"?"on":""}">V2 multi-layer<small>tiers + signals</small></button>
+        <button data-s="v2c" class="${DYNSTRAT==="v2c"?"on":""}">Mode C<small>anchor + rotation</small></button>
+      </div>
       <div class="btoggle" id="dynwin">
         <button data-w="rc" class="${DYNWIN==="rc"?"on":""}">RupeeCase window<small>2022→now</small></button>
         <button data-w="full" class="${DYNWIN==="full"?"on":""}">Full window<small>2017→now</small></button>
@@ -614,15 +637,20 @@ async function renderDynamic(){
     </div>
 
     <div class="card">
-      <h2>${v.label} ${v.sector_capped?`<span class="pill" style="background:#e7f6ef;color:#0a8f5f;font-size:10px;vertical-align:middle">🛡️ SECTOR-CONTROLLED · ${v.cap_pct}% cap</span>`:""} · ${DYNWIN==="rc"?"RupeeCase window":"Full window"} <span style="color:var(--muted);font-weight:500;font-size:14px">· ${v.start} → ${v.end}</span></h2>
+      <h2>${v.label} ${v.mode_c?`<span class="pill" style="background:#fdeefb;color:#b23aa0;font-size:10px;vertical-align:middle">🧭 MODE C</span>`:(v.strategy_v2?`<span class="pill" style="background:#eef0ff;color:#4a5ad8;font-size:10px;vertical-align:middle">🧪 V2 MULTI-LAYER</span>`:(v.sector_capped?`<span class="pill" style="background:#e7f6ef;color:#0a8f5f;font-size:10px;vertical-align:middle">🛡️ SECTOR-CONTROLLED · ${v.cap_pct}% cap</span>`:""))} · ${DYNWIN==="rc"?"RupeeCase window":"Full window"} <span style="color:var(--muted);font-weight:500;font-size:14px">· ${v.start} → ${v.end}</span></h2>
+      ${v.mode_c?`<div class="disclaimer${v.momentum_only?" good":""}"><span class="ic">🧭</span><div><b>Mode C — fixed anchor + size rotation.</b> The V2 multi-layer strategy, but the size mix uses a <b>fixed ${v.anchor_pct||40}% large-cap anchor</b> and a <b>satellite that rotates to whichever of mid- / small-cap has stronger 6-month momentum</b>. ${v.momentum_only?"On this volatile small-cap book Mode C <b>beats the simpler Base basket</b> on both windows — tuned to a "+(v.anchor_pct||40)+"% anchor.":"It beat the other tier designs (A/B) but still <b>trailed the simpler Base book</b> on this universe — shown for comparison."}</div></div>`
+        : v.strategy_v2?`<div class="disclaimer"><span class="ic">🧪</span><div><b>Experimental multi-layer strategy (V2).</b> Momentum ranked, then run through cap-tiers (large/mid/small), a 200-DMA trend gate, multi-timeframe momentum, an RSI(30)&gt;80 blow-off filter, a regime-scaled satellite, and a 25% sector + 8% stock cap — all wrapped in the 3-asset dial. In our ablation this <b>under-performed</b> the simpler sector-capped Base book; it's here so you can compare directly.</div></div>`:""}
       ${v.momentum_only?`<div class="disclaimer"><span class="ic">⚠️</span><div><b>Momentum-only on RupeeCase's own published holdings</b> (no valuation gates). This universe is <b>survivorship-tilted</b> — it's the set their momentum eventually rode to winners — so treat the return as an <b>upper bound</b>, not a clean forward test.</div></div>`:""}
       <div class="metrics">
         ${metric("Return (CAGR)", fmt(m.cagr,1)+"%", `Nifty 500: ${fmt(v.bench.nifty500.cagr,1)}%`, "up")}
+        ${metric("Volatility", fmt(m.vol,1)+"%", `annualised · Nifty 500: ${fmt(v.bench.nifty500.vol,1)}%`)}
         ${metric("Sharpe", fmt(m.sharpe,2), "return per unit of risk")}
         ${metric("Sortino", fmt(m.sortino,2), "return per unit of downside")}
         ${metric("Max Drawdown", fmt(m.maxdd,1)+"%", "worst peak-to-trough", "down")}
         ${metric("Calmar", fmt(m.calmar,2), "return ÷ drawdown")}
-        ${metric("Avg equity", fmt(m.avg_eq,0)+"%", "dial exposure (35–100%)")}
+        ${metric("Avg equity", fmt(m.avg_eq,0)+"%", "in stocks (dial 35–100%)")}
+        ${metric("Avg debt", fmt(m.avg_debt,0)+"%", "liquid ~6.5%/yr")}
+        ${metric("Avg gold", fmt(m.avg_gold,0)+"%", "GoldBees ETF")}
         ${metric("₹100 grew to", "₹"+fmt(m.final,0), `Nifty 500: ₹${fmt(v.bench.nifty500.final,0)}`)}
       </div>
       <div class="legend" style="margin-top:16px"><span><b style="background:${GREEN}"></b>Equinext Dynamic</span><span><b style="background:${GRAY}"></b>Nifty 500</span><span><b style="background:${VIOLET}"></b>Nifty 50</span></div>
@@ -663,12 +691,18 @@ async function renderDynamic(){
 
     <div class="card">
       <h2>How this basket is built</h2>
-      ${isMom
-        ? `<div class="disclaimer"><span class="ic">⚠️</span><div><b>Momentum only — no valuation or earnings gates.</b> This basket ranks purely by momentum and skips the P/E-froth and earnings-backed filters used by the valuation-momentum baskets. Steps below reflect what this basket actually does.</div></div>`
-        : `<div class="lead">Full <b>valuation-momentum</b> recipe: momentum <b>ranks</b>, valuation & earnings <b>gate</b> out the risky names — then the 3-asset dial.</div>`}
-      <div class="lead">Weighting: ${s.weighting}</div>
-      ${v.sector_capped?`<div class="lead">🛡️ <b>Sector cap:</b> after inverse-vol weighting, a hard <b>${v.cap_pct}% per-sector cap</b> is applied — any sector over the limit is trimmed and the overflow is redistributed to sectors with room, so no single sector runs the book. Stock selection is unchanged; only the sizing.</div>`:""}
-      <div class="steps">${vsteps.map(step).join("")}</div>
+      ${v2info
+        ? `<div class="lead">${v.mode_c
+              ? "<b>Mode C</b> — the multi-layer V2 engine, but the size mix uses a <b>fixed large-cap anchor</b> with a <b>mid↔small momentum rotation</b> (your design). Six steps, applied every rebalance."
+              : "<b>V2 multi-layer</b> — momentum wrapped in cap-tiers, extra technical gates, a regime-scaled size dial and hard caps. Six steps, applied every rebalance."}
+           </div>
+           <div class="steps">${v2info.map(step).join("")}</div>`
+        : `${isMom
+              ? `<div class="disclaimer"><span class="ic">⚠️</span><div><b>Momentum only — no valuation or earnings gates.</b> This basket ranks purely by momentum and skips the P/E-froth and earnings-backed filters. Steps below reflect what this basket actually does.</div></div>`
+              : `<div class="lead">Full <b>valuation-momentum</b> recipe: momentum <b>ranks</b>, valuation & earnings <b>gate</b> out the risky names — then the 3-asset dial.</div>`}
+           <div class="lead">Weighting: ${s.weighting}</div>
+           ${v.sector_capped?`<div class="lead">🛡️ <b>Sector cap:</b> after inverse-vol weighting, a hard <b>${v.cap_pct}% per-sector cap</b> is applied — overflow redistributed to sectors with room, so no single sector runs the book.</div>`:""}
+           <div class="steps">${vsteps.map(step).join("")}</div>`}
     </div>
 
     ${v.rebalances?`<div class="card">
@@ -694,8 +728,10 @@ async function renderDynamic(){
   renderDynPeriod();
 
   document.querySelectorAll("#dynidx button").forEach(b=>b.onclick=()=>{ DYNIDX=b.dataset.i; renderDynamic(); });
+  document.querySelectorAll("#dynstrat button").forEach(b=>b.onclick=()=>{ DYNSTRAT=b.dataset.s; renderDynamic(); });
   document.querySelectorAll("#dynwin button").forEach(b=>b.onclick=()=>{ DYNWIN=b.dataset.w; renderDynamic(); });
-  document.querySelectorAll("#dyncap button").forEach(b=>b.onclick=()=>{ DYNCAP=b.dataset.c; renderDynamic(); });
+  document.querySelectorAll("#dyncap button").forEach(b=>b.onclick=()=>{ if(DYNSTRAT) return; DYNCAP=b.dataset.c; renderDynamic(); });
+  if(DYNSTRAT) document.querySelectorAll("#dyncap button").forEach(b=>{ b.disabled=true; b.style.opacity=.4; b.title="V2 / Mode C already include the 25% sector + 8% stock cap"; });
 }
 
 // nav

@@ -30,6 +30,7 @@ from equinext.scoring import composite
 from equinext.primitives import (
     momentum_12_1, distance_from_high, volume_trend, realized_vol,
     return_over, valuation_froth_percentile, rerating_decomposition,
+    trend_above_ma, rsi_wilder, multi_tf_aligned,
 )
 
 FROTH_MAX = 0.80          # drop names richer than this own-history percentile
@@ -37,6 +38,10 @@ N_HOLD = 15               # top momentum names held (universe ~49)
 N_MIN = 8                 # if gates leave fewer than this, relax the froth gate
 LOOKBACK_DAYS = 800       # ~2y+ of price history for momentum/vol
 MIN_VAL_OBS = 60          # valuation rows before froth/decomp gates apply
+
+# Opt-in per-stock scoring cache (used only by _CACHE_ROWS baskets, e.g. the v2 ablation,
+# so the same (stock, date) isn't re-scored across configs). Existing baskets never touch it.
+_ROW_CACHE: dict = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -84,10 +89,15 @@ def _waterfall(w0: dict, group_of, cap: float, tol: float = 1e-12, max_iter: int
     return {s: x / tot for s, x in out.items()} if tot > tol else dict(w0)
 
 
-def cap_weights(weights: dict, sector_of, sector_cap=None, stock_cap=None, max_outer: int = 25) -> dict:
-    """Apply a hard sector-weight cap and/or per-stock cap to inverse-vol weights, by
-    alternating the two waterfalls until both hold (or `max_outer`). Weights sum to 1 and
-    within-sector inverse-vol order is preserved. Selection is untouched — only sizing."""
+def cap_weights(weights: dict, sector_of, sector_cap=None, stock_cap=None,
+                max_iter: int = 500, tol: float = 1e-12) -> dict:
+    """Apply a hard sector-weight cap AND/OR per-stock cap to inverse-vol weights, jointly
+    (both hold on exit when feasible). Each round: clip any over-cap stock and any over-cap
+    sector, then redistribute the freed weight only to names that still have room in BOTH
+    dimensions — proportional to their weight, so within-sector inverse-vol order is kept.
+    Sum stays 1; selection is untouched. If a cap is infeasible (e.g. a 25% sector with < 4
+    names under an 8% stock cap) it relaxes gracefully. Matches the pure-sector waterfall
+    when only sector_cap is set."""
     if not weights:
         return weights
     t = sum(weights.values())
@@ -96,15 +106,57 @@ def cap_weights(weights: dict, sector_of, sector_cap=None, stock_cap=None, max_o
     w = {s: float(x) / t for s, x in weights.items()}
     if sector_cap is None and stock_cap is None:
         return w
-    for _ in range(max_outer):
-        prev = dict(w)
-        if sector_cap is not None:
-            w = _waterfall(w, sector_of, sector_cap)
-        if stock_cap is not None:
-            w = _waterfall(w, lambda s: s, stock_cap)
-        if max(abs(w[s] - prev[s]) for s in w) < 1e-7:
+    sec = {s: (sector_of(s) or "Unknown") for s in w}
+    for _ in range(max_iter):
+        excess = 0.0
+        if stock_cap is not None:                          # clip over-cap stocks
+            for s in w:
+                if w[s] > stock_cap + tol:
+                    excess += w[s] - stock_cap
+                    w[s] = stock_cap
+        if sector_cap is not None:                         # clip over-cap sectors (scale their names)
+            st: dict = {}
+            for s in w:
+                st[sec[s]] = st.get(sec[s], 0.0) + w[s]
+            for g, tot in st.items():
+                if tot > sector_cap + tol:
+                    scale = sector_cap / tot
+                    for s in w:
+                        if sec[s] == g:
+                            excess += w[s] * (1.0 - scale)
+                            w[s] *= scale
+        if excess <= tol:
             break
-    return w
+        # redistribute the freed weight to names with room in BOTH dims, proportional to their
+        # remaining STOCK headroom -> a name never overshoots its cap in one step (converges cleanly).
+        st = {}
+        for s in w:
+            st[sec[s]] = st.get(sec[s], 0.0) + w[s]
+        room = [s for s in w
+                if (stock_cap is None or w[s] < stock_cap - tol)
+                and (sector_cap is None or st[sec[s]] < sector_cap - tol)]
+        if not room:
+            break                                          # jointly infeasible (too few names)
+        # weight-proportional when only a sector cap (matches the original waterfall exactly);
+        # headroom-proportional when a stock cap is present (so no name overshoots 8%).
+        hr = {s: (stock_cap - w[s]) for s in room} if stock_cap is not None else {s: w[s] for s in room}
+        tot_hr = sum(hr.values())
+        if tot_hr <= tol:
+            break
+        give = min(excess, tot_hr)
+        for s in room:
+            w[s] += give * (hr[s] / tot_hr)
+    # Infeasible remainder (tiny books where 8% is impossible): place it, then re-enforce the
+    # SECTOR cap (the headline promise) via the waterfall — accept the unavoidable stock overflow.
+    resid = 1.0 - sum(w.values())
+    if resid > tol:
+        n = len(w)
+        for s in w:
+            w[s] += resid / n
+        if sector_cap is not None:
+            w = _waterfall(w, lambda s: sec[s], sector_cap)
+    tot = sum(w.values())
+    return {s: x / tot for s, x in w.items()} if tot > tol else dict(weights)
 
 
 class ValuationMomentumBasket(Basket):
@@ -120,109 +172,162 @@ class ValuationMomentumBasket(Basket):
     SECTOR_WEIGHT_CAP = None   # None = off. e.g. 0.25 -> no sector may exceed 25% of the book
                                # (hard weight cap via waterfall; keeps the names, tempers sizing).
     MAX_STOCK_WEIGHT = None    # None = off. e.g. 0.08 -> no single stock may exceed 8% of the book.
+    # --- v2 selection gates (all OFF by default -> existing baskets are unchanged) ---
+    USE_TREND_GATE = False     # True -> keep only stocks above their TREND_MA-day moving average
+    TREND_MA = 200
+    USE_MULTI_TF = False       # True -> keep only stocks with 3/6/12-mo momentum aligned positive
+    RSI_MAX = None             # e.g. 80 -> exclude (or down-weight) names with RSI(RSI_WINDOW) above this
+    RSI_WINDOW = 30
+    RSI_SOFT = False           # False = hard-exclude RSI>RSI_MAX; True = halve their weight instead
+    _CACHE_ROWS = False        # opt-in: cache per-stock scores across configs (ablation speed-up)
 
     def _universe(self, as_of, ctx):
         """Investable universe for this rebalance. Override for a different universe
         (e.g. point-in-time membership)."""
         return ctx.universe(as_of)
 
-    def select(self, as_of, ctx) -> Selection:
-        as_of = pd.Timestamp(as_of)
+    def _score_one(self, sym, as_of, ctx, force_signals=False):
+        """Score one symbol -> row dict (or None if unscoreable). The v2 gate signals
+        (trend / multi-TF / RSI) are computed only when their flag is on — or always when
+        `force_signals` (so cached rows are config-independent). Existing baskets keep
+        their exact behavior."""
+        ohlcv = ctx.ohlcv(sym, as_of - pd.Timedelta(days=LOOKBACK_DAYS), as_of)
+        if ohlcv.empty:
+            return None
+        ohlcv = ohlcv.set_index("date")
+        close, vol = ohlcv["close"].dropna(), ohlcv["volume"].dropna()
+        if len(close) < 200:
+            return None
+
+        mom = momentum_12_1(close, as_of)
+        if not np.isfinite(mom):
+            return None
+        dh = distance_from_high(close, as_of, 52)
+        vt = volume_trend(vol, as_of)
+        rv = realized_vol(close, as_of)
+        if not np.isfinite(rv) or rv <= 0:
+            return None
+
+        # --- valuation froth + earnings-backing (only if we have history) ---
+        froth, earnings_backed, earn_growth = np.nan, True, np.nan
+        try:
+            vdf = ctx.valuation_series(sym, end=as_of, lookback_years=7)
+        except NotImplementedError:
+            vdf = None
+        if vdf is not None and len(vdf) >= MIN_VAL_OBS:
+            froth = valuation_froth_percentile(vdf, as_of, cols=self.FROTH_MULTIPLES)
+            eps = pd.to_numeric(
+                vdf.assign(date=pd.to_datetime(vdf["date"])).set_index("date")["eps_ttm"],
+                errors="coerce").dropna() if "eps_ttm" in vdf.columns else pd.Series(dtype=float)
+            g = _growth(eps, as_of, months=12)
+            earn_growth = g                       # trailing 12m earnings growth (for growth-adj gate)
+            pr = return_over(close, as_of, 12)
+            # need both > -100% for the log decomposition to be defined
+            if np.isfinite(g) and np.isfinite(pr) and g > -0.99 and pr > -0.99:
+                e_con, m_con = rerating_decomposition(pr, g)
+                if np.isfinite(e_con) and np.isfinite(m_con):
+                    earnings_backed = (e_con > 0) and (e_con >= m_con)  # earnings >= froth
+
+        trend = trend_above_ma(close, as_of, self.TREND_MA) if (force_signals or self.USE_TREND_GATE) else True
+        mtf = multi_tf_aligned(close, as_of) if (force_signals or self.USE_MULTI_TF) else True
+        rsi = rsi_wilder(close, as_of, self.RSI_WINDOW) if (force_signals or self.RSI_MAX is not None) else np.nan
+
+        return {"symbol": sym, "mom": mom, "dh": dh, "vt": vt, "vol": rv,
+                "froth": froth, "earnings_backed": earnings_backed, "earn_growth": earn_growth,
+                "trend": trend, "mtf_ok": mtf, "rsi": rsi}
+
+    def _pool_rows(self, symbols, as_of, ctx) -> list:
+        """Score all `symbols`. With _CACHE_ROWS, memoize per (stock, date) so repeated
+        configs (the ablation) don't re-score — computing all gate signals up front so the
+        cache is config-independent."""
+        if not self._CACHE_ROWS:
+            return [r for r in (self._score_one(s, as_of, ctx) for s in symbols) if r is not None]
         rows = []
-        for sym in self._universe(as_of, ctx):
-            ohlcv = ctx.ohlcv(sym, as_of - pd.Timedelta(days=LOOKBACK_DAYS), as_of)
-            if ohlcv.empty:
-                continue
-            ohlcv = ohlcv.set_index("date")
-            close, vol = ohlcv["close"].dropna(), ohlcv["volume"].dropna()
-            if len(close) < 200:
-                continue
+        for sym in symbols:
+            key = (sym, pd.Timestamp(as_of), self.FROTH_MULTIPLES, self.TREND_MA, self.RSI_WINDOW)
+            if key not in _ROW_CACHE:
+                _ROW_CACHE[key] = self._score_one(sym, as_of, ctx, force_signals=True)
+            r = _ROW_CACHE[key]
+            if r is not None:
+                rows.append(r)
+        return rows
 
-            mom = momentum_12_1(close, as_of)
-            if not np.isfinite(mom):
-                continue
-            dh = distance_from_high(close, as_of, 52)
-            vt = volume_trend(vol, as_of)
-            rv = realized_vol(close, as_of)
-            if not np.isfinite(rv) or rv <= 0:
-                continue
-
-            # --- valuation froth + earnings-backing (only if we have history) ---
-            froth, earnings_backed, earn_growth = np.nan, True, np.nan
-            try:
-                vdf = ctx.valuation_series(sym, end=as_of, lookback_years=7)
-            except NotImplementedError:
-                vdf = None
-            if vdf is not None and len(vdf) >= MIN_VAL_OBS:
-                froth = valuation_froth_percentile(vdf, as_of, cols=self.FROTH_MULTIPLES)
-                eps = pd.to_numeric(
-                    vdf.assign(date=pd.to_datetime(vdf["date"])).set_index("date")["eps_ttm"],
-                    errors="coerce").dropna() if "eps_ttm" in vdf.columns else pd.Series(dtype=float)
-                g = _growth(eps, as_of, months=12)
-                earn_growth = g                       # trailing 12m earnings growth (for growth-adj gate)
-                pr = return_over(close, as_of, 12)
-                # need both > -100% for the log decomposition to be defined
-                if np.isfinite(g) and np.isfinite(pr) and g > -0.99 and pr > -0.99:
-                    e_con, m_con = rerating_decomposition(pr, g)
-                    if np.isfinite(e_con) and np.isfinite(m_con):
-                        earnings_backed = (e_con > 0) and (e_con >= m_con)  # earnings >= froth
-
-            rows.append({"symbol": sym, "mom": mom, "dh": dh, "vt": vt, "vol": rv,
-                         "froth": froth, "earnings_backed": earnings_backed, "earn_growth": earn_growth})
-
+    def _select_pool(self, symbols, as_of, ctx, n_hold) -> tuple[dict, dict]:
+        """Score -> gate -> rank -> top-N -> inverse-vol weights for one pool of symbols.
+        Returns (weights, scores) BEFORE any sector/stock cap (the cap is applied on the
+        final book by select()). Returns ({}, {}) if nothing is scoreable."""
+        rows = self._pool_rows(symbols, as_of, ctx)
+        if not rows:
+            return {}, {}
         df = pd.DataFrame(rows).dropna(subset=["mom", "dh", "vt", "vol"])
         if df.empty:
-            raise ValueError(f"valuation_momentum: nothing scoreable at {as_of.date()}.")
+            return {}, {}
 
-        # Step 3: momentum composite (cross-sectional z of the 3 signals) — the RANK
         df["momentum"] = composite(df, ["mom", "dh", "vt"], [True, True, True])
 
-        # Steps 2 & 4: GATES. froth==nan means 'no valuation history yet' -> don't drop.
+        # Eligibility gates. froth==nan means 'no valuation history yet' -> don't drop.
+        elig = pd.Series(True, index=df.index)
         if self.USE_GATES:
             froth_ok = df["froth"].isna() | (df["froth"] <= self.FROTH_MAX)
             if self.GROWTH_EXEMPT is not None:
-                # growth-adjusted: excuse a frothy stock if its earnings are genuinely
-                # growing fast enough to justify the premium (real re-rater, not hype)
                 exempt = (df["froth"] > self.FROTH_MAX) & (df["earn_growth"] >= self.GROWTH_EXEMPT)
                 froth_ok = froth_ok | exempt
-            gated = df[froth_ok & df["earnings_backed"]]
-            pool = gated if len(gated) >= N_MIN else df.sort_values("momentum", ascending=False)
-        else:
-            pool = df                                       # ablation: momentum-only, no gates
+            elig &= froth_ok & df["earnings_backed"].astype(bool)
+        if self.USE_TREND_GATE:
+            elig &= df["trend"].astype(bool)
+        if self.USE_MULTI_TF:
+            elig &= df["mtf_ok"].astype(bool)
+        if self.RSI_MAX is not None and not self.RSI_SOFT:
+            elig &= ~(df["rsi"] > self.RSI_MAX)          # nan RSI -> not excluded (starvation guard)
+        gated = df[elig]
+        pool = gated if len(gated) >= N_MIN else df.sort_values("momentum", ascending=False)
 
         pool_sorted = pool.sort_values("momentum", ascending=False)
-        top = self._pick_top(pool_sorted, ctx)
+        top = self._pick_top(pool_sorted, ctx, n_hold)
         inv = 1.0 / top["vol"]                                   # inverse-vol weights
         weights = dict(zip(top["symbol"], inv / inv.sum()))
+        if self.RSI_MAX is not None and self.RSI_SOFT:          # soft: halve blow-off-top weights
+            rmap = dict(zip(top["symbol"], top["rsi"]))
+            weights = {s: (w * 0.5 if pd.notna(rmap.get(s)) and rmap[s] > self.RSI_MAX else w)
+                       for s, w in weights.items()}
+            tot = sum(weights.values())
+            weights = {s: w / tot for s, w in weights.items()} if tot else weights
+        scores = dict(zip(top["symbol"], top["momentum"]))
+        return weights, scores
+
+    def select(self, as_of, ctx) -> Selection:
+        as_of = pd.Timestamp(as_of)
+        weights, scores = self._select_pool(self._universe(as_of, ctx), as_of, ctx, self.N_HOLD)
+        if not weights:
+            raise ValueError(f"valuation_momentum: nothing scoreable at {as_of.date()}.")
         if self.SECTOR_WEIGHT_CAP is not None or self.MAX_STOCK_WEIGHT is not None:
             weights = cap_weights(weights, lambda s: ctx.sector(s),
                                   self.SECTOR_WEIGHT_CAP, self.MAX_STOCK_WEIGHT)
-        scores = dict(zip(top["symbol"], top["momentum"]))
-
         sel = Selection(as_of=as_of.date(), weights=weights, scores=scores)
         sel.validate()
         return sel
 
-    def _pick_top(self, pool_sorted, ctx):
-        """Take the top N_HOLD by momentum. If MAX_PER_SECTOR is set, walk down the
+    def _pick_top(self, pool_sorted, ctx, n_hold=None):
+        """Take the top n_hold by momentum. If MAX_PER_SECTOR is set, walk down the
         momentum ranking and skip a name whose sector is already full — so no single
-        sector can dominate the book. If the cap starves us below N_HOLD (too few
+        sector can dominate the book. If the cap starves us below n_hold (too few
         sectors survived the gates), top up with the next-best momentum names."""
+        n_hold = self.N_HOLD if n_hold is None else n_hold
         if self.MAX_PER_SECTOR is None:
-            return pool_sorted.head(self.N_HOLD)
+            return pool_sorted.head(n_hold)
         picked, sec_count = [], {}
         for sym in pool_sorted["symbol"]:
             sec = ctx.sector(sym) or "Unknown"
             if sec_count.get(sec, 0) < self.MAX_PER_SECTOR:
                 picked.append(sym)
                 sec_count[sec] = sec_count.get(sec, 0) + 1
-            if len(picked) >= self.N_HOLD:
+            if len(picked) >= n_hold:
                 break
-        if len(picked) < self.N_HOLD:                  # cap starved us -> top up by momentum
+        if len(picked) < n_hold:                  # cap starved us -> top up by momentum
             for sym in pool_sorted["symbol"]:
                 if sym not in picked:
                     picked.append(sym)
-                    if len(picked) >= self.N_HOLD:
+                    if len(picked) >= n_hold:
                         break
         return pool_sorted[pool_sorted["symbol"].isin(picked)]
 
