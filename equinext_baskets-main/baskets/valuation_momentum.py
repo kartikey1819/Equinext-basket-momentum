@@ -30,7 +30,7 @@ from equinext.scoring import composite
 from equinext.primitives import (
     momentum_12_1, distance_from_high, volume_trend, realized_vol,
     return_over, valuation_froth_percentile, rerating_decomposition,
-    trend_above_ma, rsi_wilder, multi_tf_aligned,
+    trend_above_ma, rsi_wilder, multi_tf_aligned, anchored_vwap_high,
 )
 
 FROTH_MAX = 0.80          # drop names richer than this own-history percentile
@@ -179,6 +179,9 @@ class ValuationMomentumBasket(Basket):
     RSI_MAX = None             # e.g. 80 -> exclude (or down-weight) names with RSI(RSI_WINDOW) above this
     RSI_WINDOW = 30
     RSI_SOFT = False           # False = hard-exclude RSI>RSI_MAX; True = halve their weight instead
+    USE_VWAP_GATE = False      # True -> drop names trading below their anchored-VWAP-since-52wk-high
+    VWAP_WEEKS = 52            # anchor = highest high in this trailing window
+    VWAP_TOL = 0.0             # keep if close >= AVWAP*(1-tol); 0.0 = strict above-AVWAP, 0.05 = 5% band
     _CACHE_ROWS = False        # opt-in: cache per-stock scores across configs (ablation speed-up)
 
     def _universe(self, as_of, ctx):
@@ -231,10 +234,11 @@ class ValuationMomentumBasket(Basket):
         trend = trend_above_ma(close, as_of, self.TREND_MA) if (force_signals or self.USE_TREND_GATE) else True
         mtf = multi_tf_aligned(close, as_of) if (force_signals or self.USE_MULTI_TF) else True
         rsi = rsi_wilder(close, as_of, self.RSI_WINDOW) if (force_signals or self.RSI_MAX is not None) else np.nan
+        vwap_r = anchored_vwap_high(ohlcv, as_of, self.VWAP_WEEKS) if (force_signals or self.USE_VWAP_GATE) else np.nan
 
         return {"symbol": sym, "mom": mom, "dh": dh, "vt": vt, "vol": rv,
                 "froth": froth, "earnings_backed": earnings_backed, "earn_growth": earn_growth,
-                "trend": trend, "mtf_ok": mtf, "rsi": rsi}
+                "trend": trend, "mtf_ok": mtf, "rsi": rsi, "vwap_r": vwap_r}
 
     def _pool_rows(self, symbols, as_of, ctx) -> list:
         """Score all `symbols`. With _CACHE_ROWS, memoize per (stock, date) so repeated
@@ -244,7 +248,7 @@ class ValuationMomentumBasket(Basket):
             return [r for r in (self._score_one(s, as_of, ctx) for s in symbols) if r is not None]
         rows = []
         for sym in symbols:
-            key = (sym, pd.Timestamp(as_of), self.FROTH_MULTIPLES, self.TREND_MA, self.RSI_WINDOW)
+            key = (sym, pd.Timestamp(as_of), self.FROTH_MULTIPLES, self.TREND_MA, self.RSI_WINDOW, self.VWAP_WEEKS)
             if key not in _ROW_CACHE:
                 _ROW_CACHE[key] = self._score_one(sym, as_of, ctx, force_signals=True)
             r = _ROW_CACHE[key]
@@ -279,6 +283,9 @@ class ValuationMomentumBasket(Basket):
             elig &= df["mtf_ok"].astype(bool)
         if self.RSI_MAX is not None and not self.RSI_SOFT:
             elig &= ~(df["rsi"] > self.RSI_MAX)          # nan RSI -> not excluded (starvation guard)
+        if self.USE_VWAP_GATE:
+            # keep names at/above their anchored-VWAP-since-52wk-high (within tol); nan -> don't drop
+            elig &= df["vwap_r"].isna() | (df["vwap_r"] >= 1.0 - self.VWAP_TOL)
         gated = df[elig]
         pool = gated if len(gated) >= N_MIN else df.sort_values("momentum", ascending=False)
 

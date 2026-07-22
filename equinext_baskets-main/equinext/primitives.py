@@ -194,6 +194,38 @@ def rsi_wilder(close: pd.Series, end, window: int = 30) -> float:
     return float(100.0 - 100.0 / (1.0 + rs))
 
 
+def anchored_vwap_high(ohlcv: pd.DataFrame, end, weeks: int = 52) -> float:
+    """Ratio of the latest close to the ANCHORED VWAP since the 52-week high.
+
+    Anchored VWAP (AVWAP) fixes the volume-weighted average price at a meaningful
+    event and accumulates forward. Here the anchor is the date of the highest high in
+    the trailing `weeks` window: AVWAP = cum(typical_price * volume) / cum(volume) from
+    that peak to `end`, where typical_price = (H+L+C)/3.
+
+    Interpretation (the whole point): AVWAP-since-the-high is the *average price every
+    buyer has paid since the stock topped out*. So the ratio returned is
+        latest_close / AVWAP_since_high
+      > 1.0  price is ABOVE what the average post-peak buyer paid -> accumulation / still strong
+      < 1.0  the average buyer since the high is UNDERWATER -> distribution / weakening
+    Gate a book by dropping names whose ratio is below (1 - tolerance). nan if not computable.
+    """
+    end = pd.Timestamp(end)
+    o = ohlcv[ohlcv.index <= end].dropna(subset=["high", "low", "close", "volume"])
+    win = o[o.index >= end - pd.Timedelta(weeks=weeks)]
+    if win.empty:
+        return np.nan
+    anchor = win["high"].idxmax()                      # date of the 52-week high
+    seg = o[o.index >= anchor]
+    v = seg["volume"]
+    denom = float(v.sum())
+    if seg.empty or denom <= 0:
+        return np.nan
+    tp = (seg["high"] + seg["low"] + seg["close"]) / 3.0
+    avwap = float((tp * v).sum() / denom)
+    last = float(seg["close"].iloc[-1])
+    return last / avwap if avwap else np.nan
+
+
 def multi_tf_aligned(close: pd.Series, end, months=(3, 6, 12), min_pos: int = 3) -> bool:
     """Multi-timeframe momentum confirmation: are at least `min_pos` of the trailing
     3/6/12-month returns positive? Filters out names whose trend is already rolling over."""

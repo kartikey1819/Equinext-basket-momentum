@@ -425,6 +425,34 @@ def strategy():
     })
 
 
+@app.route("/api/sectorcap")
+def sectorcap():
+    """25%-sector-cap comparison for the 12 main baskets: uncapped vs capped (each rebalance's
+    inverse-vol weights passed through a hard 25% per-sector cap), metrics + curves + latest
+    capped weights. Served from build_sectorcap_main.py's JSON."""
+    import json
+    f = _REPO / "webapp" / "sectorcap_results.json"
+    if not f.exists():
+        return jsonify({"ready": False})
+    data = json.loads(f.read_text(encoding="utf-8"))
+    data["ready"] = True
+    return jsonify(data)
+
+
+@app.route("/api/stoploss")
+def stoploss():
+    """Stop-loss protection overlay for the 12 main (100%-equity) baskets: plain book
+    vs stop-protected book (same holdings, replayed daily through the stop engine),
+    metrics + curves. Served from build_stoploss.py's JSON."""
+    import json
+    f = _REPO / "webapp" / "stoploss_results.json"
+    if not f.exists():
+        return jsonify({"ready": False})
+    data = json.loads(f.read_text(encoding="utf-8"))
+    data["ready"] = True
+    return jsonify(data)
+
+
 @app.route("/api/dynamic")
 def dynamic():
     """Equinext Dynamic (valuation-momentum + monthly 3-asset switch) precomputed

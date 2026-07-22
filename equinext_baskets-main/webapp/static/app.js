@@ -74,12 +74,12 @@ function sectorCardHTML(sa, prefix, label, capPct){
     <h2>Sector allocation <span class="pill sec" style="font-size:10px">real backtest data</span></h2>
     <div class="lead">Momentum picks <i>stocks</i>, not sectors — so here's where the money actually lands. All weights are % of the equity book${label?` (${label})`:""}.</div>
     <div class="metrics">
-      ${metric("Peak in one sector", fmt(p.weight,0)+"%", p.sector+" · "+p.date, p.weight>=40?"down":(capPct?"up":""))}
+      ${metric("Peak in one sector", fmt(p.weight,0)+"%", p.sector+" · "+p.date, p.weight>=40?"down":(capPct?(p.weight<=capPct+1?"up":""):""))}
       ${metric("Typical top sector", fmt(sa.avg_top,0)+"%", "avg largest sector")}
       ${metric("Sectors held", fmt(sa.avg_sectors,1), "avg spread, out of 11")}
       ${metric("Biggest single stock", b.sym, fmt(b.weight,1)+"% · "+b.date)}
     </div>
-    ${sa.infeasible_rebalances>0?`<div class="gapnote" style="text-align:left;margin-top:6px;font-size:11px">The 8% stock cap holds at every rebalance where it's mathematically achievable. At <b>${sa.infeasible_rebalances}</b> rebalance${sa.infeasible_rebalances>1?"s":""} the book was too concentrated (a couple of big sectors + single-stock sectors) for 8% to be possible — there the <b>25% sector cap was kept</b> and a few names ran slightly above 8%.</div>`:""}
+    ${sa.infeasible_rebalances>0?`<div class="gapnote" style="text-align:left;margin-top:6px;font-size:11px">The <b>${capPct||25}% sector cap</b> holds at every rebalance where it's mathematically achievable. At <b>${sa.infeasible_rebalances}</b> rebalance${sa.infeasible_rebalances>1?"s":""} momentum had piled most of the ${sa.avg_sectors?"~15":""} names into a single sector (e.g. the 2022 PSU-bank run), so ${capPct||25}% simply isn't reachable without dropping stocks — there a sector runs above ${capPct||25}%. The peak shown is that worst case; the typical top sector is ${fmt(sa.avg_top,0)}%.</div>`:""}
     ${capPct
       ? `<div class="disclaimer good"><span class="ic">🛡️</span><div><b>Sector-controlled.</b> A hard <b>${capPct}% cap</b> is applied after weighting, so no sector exceeds ${capPct}% of the book — overflow is redistributed to other sectors. Flip to <b>Uncapped</b> above to see momentum's raw ${fmt(p.weight,0)>=40?"~50%+":""} tilt.</div></div>`
       : (p.weight>=40?`<div class="disclaimer"><span class="ic">⚠️</span><div><b>At its most concentrated, ${fmt(p.weight,0)}% of the equity book sat in ${p.sector}</b> (${p.date}). With no sector cap, momentum can let one sector dominate — switch to <b>Sector-controlled</b> above to hold this at ${25}%.</div></div>`:"")}
@@ -135,7 +135,7 @@ function renderSectorCharts(sa, prefix){
   renderSectorHeatmap(sa, prefix+"rotate");
 }
 
-let STOCKS = [], CUR = null, RANGE = 252, _price = 0, CURINDEX = "n50", CURUNI = "standard", CURCAD = "";
+let STOCKS = [], CUR = null, RANGE = 252, _price = 0, CURINDEX = "n50", CURUNI = "standard", CURCAD = "", STOPMODE = false, SECTORCAP = false;
 const BASE = {n50:{standard:"vm_pe_only", pit:"vm_pit"}, n500:{standard:"vm500", pit:"vm500_pit"}};
 const curKey = () => BASE[CURINDEX][CURUNI] + CURCAD;
 const idxKeys = () => ["standard","pit"].flatMap(u => ["","_M","_2M"].map(c => BASE[CURINDEX][u] + c));
@@ -162,11 +162,13 @@ function jumpSearch(q){ const m = filterStocks(q); if(q && m.length){ switchView
 async function renderBasket(){
   const bk = curKey();
   const q = "?basket=" + bk;
-  const [s, b, rbAll, cmp] = await Promise.all([
+  const [s, b, rbAll, cmp, sl, sc] = await Promise.all([
     cachedJSON("/api/strategy" + q),
     cachedJSON("/api/basket" + q),
     cachedJSON("/api/rebalances" + q),
     cachedJSON("/api/compare"),
+    cachedJSON("/api/stoploss"),
+    cachedJSON("/api/sectorcap"),
   ]);
   const REB = rbAll.rebalances || [];
   const m = b.metrics, excess = (m.cagr != null && m.cagr_nifty != null) ? m.cagr - m.cagr_nifty : null;
@@ -176,9 +178,73 @@ async function renderBasket(){
   const gap = (std.cagr != null && pit.cagr != null) ? std.cagr - pit.cagr : null;
   const keys = idxKeys();
   const pit500 = CURINDEX === "n500";
+  const slb = ((sl && sl.baskets) || {})[bk];
+  const scb = ((sc && sc.baskets) || {})[bk];
+  const SM = STOPMODE && !!slb;                       // stop-protected lens active (only if data exists)
+  const CM = SECTORCAP && !!scb;                      // sector-controlled lens active
+  // lens-aware headline metrics: swap CAGR/Sharpe/DD/final to the stop-protected or capped book
+  const M = SM ? {cagr: slb.stop.cagr, cagr_nifty: slb.index_metrics.cagr, sharpe: slb.stop.sharpe,
+                  max_dd: slb.stop.maxdd, final: slb.stop.final, final_nifty: slb.index_metrics.final, years: m.years}
+          : CM ? {cagr: scb.capped.cagr, cagr_nifty: scb.index_metrics.cagr, sharpe: scb.capped.sharpe,
+                  max_dd: scb.capped.maxdd, final: scb.capped.final, final_nifty: scb.index_metrics.final, years: m.years}
+          : m;
+  const excessM = (M.cagr != null && M.cagr_nifty != null) ? M.cagr - M.cagr_nifty : null;
+  // holdings: in the sector-controlled lens, show the capped weights (re-sorted); else the raw book
+  const holds = (CM && scb.latest && scb.latest.weights)
+    ? b.holdings.map(h => ({...h, weight: (scb.latest.weights[h.symbol] != null ? scb.latest.weights[h.symbol] : h.weight)}))
+                .sort((a, b) => (b.weight || 0) - (a.weight || 0))
+    : b.holdings;
+  // the plain-vs-stop teaser card only shows in the PLAIN lens
+  const stopCard = (slb && !SM && !CM) ? `
+    <div class="card">
+      <h2>Stop-Loss Protection <span class="pill sec">${slb.stop_desc}</span></h2>
+      <div class="lead">This is a <b>100% equity</b> basket — there's no 3-asset dial to cushion a crash. A <b>${slb.stop_desc}</b> (exit a stock to cash the moment it falls ${slb.stop_pct}% ${slb.trailing?"below its running peak":"below its entry price"}, then buy back in at the next rebalance) adds that missing downside brake. Same 15 holdings, replayed day-by-day through the stop. Here's the book <b>with vs without</b> it.</div>
+      <div class="metrics">
+        ${stopM("Return (CAGR)", slb.plain.cagr, slb.stop.cagr, "%", 1)}
+        ${stopM("Sharpe", slb.plain.sharpe, slb.stop.sharpe, "", 2)}
+        ${stopM("Max Drawdown", slb.plain.maxdd, slb.stop.maxdd, "%", 1)}
+        ${stopM("Calmar (CAGR/DD)", slb.plain.calmar, slb.stop.calmar, "", 2)}
+      </div>
+      <div class="legend" style="margin-top:14px"><span><b style="background:${GRAY}"></b>${idxName}</span><span><b style="background:${VIOLET}"></b>Plain equity</span><span><b style="background:${GREEN}"></b>Stop-protected</span></div>
+      <div id="stopcurve" style="height:300px"></div>
+      <div class="gapnote" style="text-align:left">The stop gives up little raw return but sharply cuts the worst drawdown — on these un-dialed equity books that lifts <b>risk-adjusted</b> return (Sharpe & Calmar) clearly. On the Dynamic Allocator baskets the same stop is redundant, because the 3-asset dial already de-risks in downturns. Net of 25 bps/side cost; shown pre-tax (the stop adds some short-term-gains turnover).</div>
+    </div>` : "";
   const disc = s.survivorship
     ? `<div class="disclaimer"><span class="ic">⚠️</span><div><b>Why this number is optimistic.</b> The <b>Standard</b> universe is <b>today's</b> ${idxName} applied to the past — which leaves out companies later dropped from the index after falling (<b>survivorship bias</b>). Treat the CAGR as an upper bound; switch to <b>Point-in-Time</b> for the honest number.</div></div>`
     : `<div class="disclaimer good"><span class="ic">${pit500?"⚠️":"✅"}</span><div><b>${pit500?"Survivorship-free — but approximate for the Nifty 500.":"This is the survivorship-free result — the trustworthy one."}</b> The universe is whoever was <b>actually</b> a large-cap on each date, including companies later dropped after falling. ${pit500?"<b>Caveat:</b> many Nifty-500 dropouts delisted and can't be sourced, so meaningful residual bias remains here — treat it as a partial correction.":"No hindsight, no cherry-picking today's winners."}</div></div>`;
+
+  // the big curve card: sector-cap impact (cap lens) / stop impact (stop lens) / survivorship gap (plain)
+  const curveCard = CM ? `
+    <div class="card">
+      <h3 class="mini">Sector cap impact · ${idxName} · ${cadName}</h3>
+      <div class="cmp">
+        <div class="cmpbox opt"><div class="lbl">Uncapped</div><div class="big up">${fmt(scb.uncapped.cagr,1)}%</div><div class="d">CAGR · Sharpe ${fmt(scb.uncapped.sharpe,2)}</div></div>
+        <div class="gap"><div class="n">${scb.capped.cagr-scb.uncapped.cagr>=0?"+":""}${fmt(scb.capped.cagr-scb.uncapped.cagr,1)}%</div><div class="l">CAGR</div></div>
+        <div class="cmpbox real"><div class="lbl">Sector-controlled · 25%</div><div class="big up">${fmt(scb.capped.cagr,1)}%</div><div class="d">CAGR · Sharpe ${fmt(scb.capped.sharpe,2)}</div></div>
+      </div>
+      <div class="legend" style="margin-top:16px"><span><b style="background:${GRAY}"></b>${idxName}</span><span><b style="background:${VIOLET}"></b>Uncapped</span><span><b style="background:${GREEN}"></b>Sector-controlled 25%</span></div>
+      <div id="curve" style="height:300px"></div>
+    </div>` : SM ? `
+    <div class="card">
+      <h3 class="mini">Stop-loss impact · ${idxName} · ${cadName}</h3>
+      <div class="cmp">
+        <div class="cmpbox opt"><div class="lbl">Plain equity</div><div class="big up">${fmt(slb.plain.cagr,1)}%</div><div class="d">CAGR · worst fall ${fmt(slb.plain.maxdd,1)}%</div></div>
+        <div class="gap"><div class="n">${fmt(slb.stop.maxdd-slb.plain.maxdd,1)}%</div><div class="l">shallower DD</div></div>
+        <div class="cmpbox real"><div class="lbl">Stop-protected · ${slb.stop_desc}</div><div class="big up">${fmt(slb.stop.cagr,1)}%</div><div class="d">CAGR · worst fall ${fmt(slb.stop.maxdd,1)}%</div></div>
+      </div>
+      <div class="legend" style="margin-top:16px"><span><b style="background:${GRAY}"></b>${idxName}</span><span><b style="background:${VIOLET}"></b>Plain equity</span><span><b style="background:${GREEN}"></b>Stop-protected</span></div>
+      <div id="curve" style="height:300px"></div>
+    </div>` : `
+    <div class="card">
+      <h3 class="mini">Survivorship gap · ${idxName} · ${cadName}</h3>
+      <div class="cmp">
+        <div class="cmpbox opt"><div class="lbl">Standard · optimistic</div><div class="big up">${fmt(std.cagr,1)}%</div><div class="d">CAGR · ₹100→₹${fmt(std.final,0)}</div></div>
+        <div class="gap"><div class="n">−${fmt(gap,1)}%</div><div class="l">bias / yr</div></div>
+        <div class="cmpbox real"><div class="lbl">Point-in-Time · real</div><div class="big up">${fmt(pit.cagr,1)}%</div><div class="d">CAGR · ₹100→₹${fmt(pit.final,0)}</div></div>
+      </div>
+      <div class="legend" style="margin-top:16px"><span><b style="background:${GREEN}"></b>Standard</span><span><b style="background:${VIOLET}"></b>Point-in-Time</span><span><b style="background:${GRAY}"></b>${idxName}</span></div>
+      <div id="curve" style="height:300px"></div>
+    </div>`;
 
   $("#basket").innerHTML = `
     <div class="hero">
@@ -200,44 +266,48 @@ async function renderBasket(){
         <button data-c="_M" class="${CURCAD==="_M"?"on":""}">Monthly</button>
         <button data-c="_2M" class="${CURCAD==="_2M"?"on":""}">Bi-monthly</button>
       </div>
+      ${(slb||scb)?`<div class="btoggle" id="modetoggle">
+        <button data-v="plain" class="${!SM&&!CM?"on":""}">Equity book<small>as-is</small></button>
+        ${scb?`<button data-v="cap" class="${CM?"on":""}">Sector-controlled<small>max 25% / sector</small></button>`:""}
+        ${slb?`<button data-v="stop" class="${SM?"on":""}">Stop-protected<small>${slb.stop_desc}</small></button>`:""}
+      </div>`:""}
     </div>
+    ${CM?`<div class="disclaimer good" style="margin-top:14px"><span class="ic">🛡️</span><div><b>Sector-controlled view.</b> Every number below is the basket with a hard <b>25% per-sector cap</b> applied at each rebalance — after inverse-vol weighting, any sector over 25% is trimmed and the overflow redistributed to sectors with room, so no single sector runs the book.${scb.latest.peak_sector?` Latest rebalance: <b>${scb.latest.peak_sector}</b> was ${fmt(scb.latest.peak_before,1)}% → held to ${fmt(scb.latest.peak_after,1)}%.`:""} Net of 25 bps/side. Toggle back to <b>Equity book</b> for the raw momentum tilt.</div></div>`:""}
+    ${SM?`<div class="disclaimer good" style="margin-top:14px"><span class="ic">🛡️</span><div><b>Stop-protected view.</b> Every number below is the basket run <b>with a ${slb.stop_desc}</b> applied throughout — exit a stock to cash once it falls ${slb.stop_pct}% ${slb.trailing?"below its running peak":"below entry"}, buy back at the next rebalance. Same 15 holdings, replayed day-by-day through the stop; net of 25 bps/side, shown pre-tax. Toggle back to <b>Equity book</b> for the as-is numbers.</div></div>`:""}
 
     <div class="card" style="margin-top:14px">
       <h2>${idxName} — all 6 baskets compared</h2>
       <div class="lead">Two universes × three rebalance frequencies — same strategy throughout. Click a row to open it. (Use the toggle above to switch between Nifty 50 and Nifty 500.)</div>
-      <table><thead><tr><th>Basket</th><th>CAGR</th><th>After-tax</th><th>Sharpe</th><th>Basket Max DD</th><th>${idxName} Max DD</th><th>Turnover/yr</th><th>₹100→</th></tr></thead>
-      <tbody>${keys.map(k=>{const c=cmp[k]||{},mm=(c.metrics)||{};const rdy=c.ready;return `<tr data-k="${k}" class="${k===bk?"selrow":""}">
+      <table><thead><tr><th>Basket</th><th>CAGR</th><th>${SM||CM?"Calmar":"After-tax"}</th><th>Sharpe</th><th>Basket Max DD</th><th>${idxName} Max DD</th><th>Turnover/yr</th><th>₹100→</th></tr></thead>
+      <tbody>${keys.map(k=>{const c=cmp[k]||{},mm=(c.metrics)||{};const rdy=c.ready;
+        const sk=((sl&&sl.baskets)||{})[k], ck=((sc&&sc.baskets)||{})[k];
+        const act=SM&&sk?sk.stop:(CM&&ck?ck.capped:null);return `<tr data-k="${k}" class="${k===bk?"selrow":""}">
         <td><b>${c.universe||"—"}</b> <span class="cad">· ${c.cadence||""}</span></td>
-        ${rdy?`<td>${fmt(mm.cagr,1)}%</td><td>${fmt(mm.cagr_after_tax,1)}%</td><td>${fmt(mm.sharpe,2)}</td>
-        <td class="down">${fmt(mm.max_dd,1)}%</td><td class="down">${fmt(mm.max_dd_nifty,1)}%</td><td>${fmt(mm.turnover_yr,0)}%</td><td>₹${fmt(mm.final,0)}</td>`
+        ${rdy?(act?`<td>${fmt(act.cagr,1)}%</td><td>${fmt(act.calmar,2)}</td><td>${fmt(act.sharpe,2)}</td>
+        <td class="down">${fmt(act.maxdd,1)}%</td><td class="down">${fmt(mm.max_dd_nifty,1)}%</td><td>${fmt(mm.turnover_yr,0)}%</td><td>₹${fmt(act.final,0)}</td>`
+        :`<td>${fmt(mm.cagr,1)}%</td><td>${fmt(mm.cagr_after_tax,1)}%</td><td>${fmt(mm.sharpe,2)}</td>
+        <td class="down">${fmt(mm.max_dd,1)}%</td><td class="down">${fmt(mm.max_dd_nifty,1)}%</td><td>${fmt(mm.turnover_yr,0)}%</td><td>₹${fmt(mm.final,0)}</td>`)
         :`<td colspan="7" style="color:var(--muted)">not yet computed</td>`}</tr>`}).join("")}</tbody></table>
-      <div class="gapnote" style="text-align:left">Nifty benchmark over the same window: <b>${fmt(std.cagr_nifty,1)}%/yr</b>. Where present, the <b>Standard</b> rows sit above the <b>Point-in-Time</b> rows — that gap is survivorship bias, not skill.</div>
+      <div class="gapnote" style="text-align:left">${CM?`Every row is the <b>sector-controlled</b> book (hard 25% per-sector cap); the <b>Calmar</b> column is CAGR ÷ worst drawdown. Index Max DD & turnover are of the underlying selection. `:SM?`Every row is the <b>stop-protected</b> book (${slb.stop_desc}); the <b>Calmar</b> column (CAGR ÷ worst drawdown) is where the stop shows its edge. Index Max DD & turnover are of the underlying selection. `:""}Nifty benchmark over the same window: <b>${fmt(std.cagr_nifty,1)}%/yr</b>. Where present, the <b>Standard</b> rows sit above the <b>Point-in-Time</b> rows — that gap is survivorship bias, not skill.</div>
     </div>
 
-    <div class="card">
-      <h3 class="mini">Survivorship gap · ${idxName} · ${cadName}</h3>
-      <div class="cmp">
-        <div class="cmpbox opt"><div class="lbl">Standard · optimistic</div><div class="big up">${fmt(std.cagr,1)}%</div><div class="d">CAGR · ₹100→₹${fmt(std.final,0)}</div></div>
-        <div class="gap"><div class="n">−${fmt(gap,1)}%</div><div class="l">bias / yr</div></div>
-        <div class="cmpbox real"><div class="lbl">Point-in-Time · real</div><div class="big up">${fmt(pit.cagr,1)}%</div><div class="d">CAGR · ₹100→₹${fmt(pit.final,0)}</div></div>
-      </div>
-      <div class="legend" style="margin-top:16px"><span><b style="background:${GREEN}"></b>Standard</span><span><b style="background:${VIOLET}"></b>Point-in-Time</span><span><b style="background:${GRAY}"></b>${idxName}</span></div>
-      <div id="curve" style="height:300px"></div>
-    </div>
+    ${curveCard}
 
     ${disc}
 
     <div class="metrics">
-      ${metric("Return (CAGR)", fmt(m.cagr,1)+"%", `full period · ${idxName}: ${fmt(m.cagr_nifty,1)}%`, "up")}
-      ${metric("Beats index by", (excess>=0?"+":"")+fmt(excess,1)+"% / yr", "annualised excess", excess>=0?"up":"down")}
-      ${metric("Sharpe", fmt(m.sharpe,2), "return per unit of risk")}
-      ${metric("Max Drawdown", fmt(m.max_dd,1)+"%", "worst peak-to-trough fall", "down")}
-      ${metric("₹100 grew to", "₹"+fmt(m.final,0), `${idxName}: ₹${fmt(m.final_nifty,0)} · ${fmt(m.years,1)}y`)}
+      ${metric("Return (CAGR)", fmt(M.cagr,1)+"%", `full period · ${idxName}: ${fmt(M.cagr_nifty,1)}%`, "up")}
+      ${metric("Beats index by", (excessM>=0?"+":"")+fmt(excessM,1)+"% / yr", "annualised excess", excessM>=0?"up":"down")}
+      ${metric("Sharpe", fmt(M.sharpe,2), SM?"return per unit of risk · stop-protected":CM?"return per unit of risk · sector-controlled":"return per unit of risk")}
+      ${metric("Max Drawdown", fmt(M.max_dd,1)+"%", SM?`vs ${fmt(slb.plain.maxdd,1)}% un-stopped`:CM?`vs ${fmt(scb.uncapped.maxdd,1)}% uncapped`:"worst peak-to-trough fall", "down")}
+      ${metric("₹100 grew to", "₹"+fmt(M.final,0), `${idxName}: ₹${fmt(M.final_nifty,0)} · ${fmt(M.years,1)}y`)}
     </div>
+
+    ${stopCard}
 
     <div class="card">
       <h2>Returns by period</h2>
-      <div class="lead">The CAGR above covers the whole backtest. Pick a trailing window below to see how the basket did versus ${idxName} over just that stretch — computed straight from the daily backtest curve.</div>
+      <div class="lead">The CAGR above covers the whole backtest. Pick a trailing window below to see how the basket did versus ${idxName} over just that stretch — computed straight from the ${SM?"stop-protected":CM?"sector-controlled":"daily backtest"} curve.</div>
       <div class="btoggle" id="pertoggle">
         <button data-mo="1">1M</button>
         <button data-mo="3">3M</button>
@@ -273,10 +343,10 @@ async function renderBasket(){
     </div>
 
     <div class="card">
-      <h2>Current Holdings <span style="color:var(--muted);font-weight:500;font-size:14px">· ${b.holdings.length} stocks</span></h2>
-      <div class="lead">Weighting: ${s.weighting}. Click any stock for full analysis.</div>
+      <h2>Current Holdings <span style="color:var(--muted);font-weight:500;font-size:14px">· ${holds.length} stocks</span></h2>
+      <div class="lead">Weighting: ${s.weighting}.${CM?" <b>Weights shown are after the 25% sector cap</b> (re-sorted).":""} Click any stock for full analysis.</div>
       <table><thead><tr><th>#</th><th>Stock</th><th>Sector</th><th>Weight</th><th>Momentum</th><th>Price</th><th>Day</th></tr></thead>
-      <tbody>${b.holdings.map((h,i)=>`<tr data-sym="${h.symbol}">
+      <tbody>${holds.map((h,i)=>`<tr data-sym="${h.symbol}">
         <td>${i+1}</td>
         <td><span class="sym">${h.symbol}</span><div class="nm">${h.name||""}</div></td>
         <td><span class="pill sec">${(h.sector||"—").replace("Financial Services","Financials")}</span></td>
@@ -286,7 +356,7 @@ async function renderBasket(){
         <td class="${cls(h.change_pct)}">${pct(h.change_pct)}</td></tr>`).join("")}</tbody></table>
     </div>
 
-    ${rbAll.sector?sectorCardHTML(rbAll.sector, "bsec", `${idxName} · ${cmp[bk].universe}`):""}
+    ${(CM?scb.sector:rbAll.sector)?sectorCardHTML(CM?scb.sector:rbAll.sector, "bsec", `${idxName} · ${cmp[bk].universe}`, CM?25:undefined):""}
 
     <div class="card">
       <h2>Rebalance History <span style="color:var(--muted);font-weight:500;font-size:14px">· ${REB.length} rebalances</span></h2>
@@ -310,26 +380,57 @@ async function renderBasket(){
   paint(REB.slice(0,8));
   if($("#showall")) $("#showall").onclick = e => { paint(REB); e.target.remove(); };
 
-  renderSectorCharts(rbAll.sector, "bsec");
+  renderSectorCharts(CM?scb.sector:rbAll.sector, "bsec");
 
-  // overlay Standard + Point-in-Time (this index & cadence) + Nifty; highlight selected universe
-  const cs = (cmp[stdK]||{}).curve, cp = (cmp[pitK]||{}).curve;
-  if(cs && cs.dates){
-    const wS = CURUNI==="standard"?2.8:1.4, wP = CURUNI==="pit"?2.8:1.4;
-    const tr = [{x:cs.dates,y:cs.nifty,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:idxName},
-      {x:cs.dates,y:cs.basket,type:"scatter",mode:"lines",line:{color:GREEN,width:wS},name:"Standard"}];
-    if(cp && cp.dates) tr.push({x:cp.dates,y:cp.basket,type:"scatter",mode:"lines",line:{color:VIOLET,width:wP},name:"Point-in-Time"});
-    Plotly.newPlot("curve",tr,{...LAY,height:300,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
-  } else { $("#curve").innerHTML = '<div class="loading">Not computed yet.</div>'; }
+  // main curve: cap lens -> uncapped/capped/index; stop lens -> plain/stop/index; plain -> Standard/PIT/index
+  if(CM){
+    const c = scb.curve;
+    Plotly.newPlot("curve",[
+      {x:c.index.dates,y:c.index.values,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:idxName},
+      {x:c.uncapped.dates,y:c.uncapped.values,type:"scatter",mode:"lines",line:{color:VIOLET,width:1.6},name:"Uncapped"},
+      {x:c.capped.dates,y:c.capped.values,type:"scatter",mode:"lines",line:{color:GREEN,width:2.8},name:"Sector-controlled 25%"},
+    ],{...LAY,height:300,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
+  } else if(SM){
+    const c = slb.curve;
+    Plotly.newPlot("curve",[
+      {x:c.index.dates,y:c.index.values,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:idxName},
+      {x:c.plain.dates,y:c.plain.values,type:"scatter",mode:"lines",line:{color:VIOLET,width:1.6},name:"Plain equity"},
+      {x:c.stop.dates,y:c.stop.values,type:"scatter",mode:"lines",line:{color:GREEN,width:2.8},name:"Stop-protected"},
+    ],{...LAY,height:300,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
+  } else {
+    // overlay Standard + Point-in-Time (this index & cadence) + Nifty; highlight selected universe
+    const cs = (cmp[stdK]||{}).curve, cp = (cmp[pitK]||{}).curve;
+    if(cs && cs.dates){
+      const wS = CURUNI==="standard"?2.8:1.4, wP = CURUNI==="pit"?2.8:1.4;
+      const tr = [{x:cs.dates,y:cs.nifty,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:idxName},
+        {x:cs.dates,y:cs.basket,type:"scatter",mode:"lines",line:{color:GREEN,width:wS},name:"Standard"}];
+      if(cp && cp.dates) tr.push({x:cp.dates,y:cp.basket,type:"scatter",mode:"lines",line:{color:VIOLET,width:wP},name:"Point-in-Time"});
+      Plotly.newPlot("curve",tr,{...LAY,height:300,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
+    } else { $("#curve").innerHTML = '<div class="loading">Not computed yet.</div>'; }
+  }
 
-  // trailing-period returns, computed from the daily backtest curve
-  PCURVE = b.curve; PIDX = idxName;
+  // stop-loss protection teaser overlay (plain lens only): plain vs stop-protected vs index
+  if(slb && !SM && !CM){
+    const c = slb.curve;
+    Plotly.newPlot("stopcurve",[
+      {x:c.index.dates,y:c.index.values,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:idxName},
+      {x:c.plain.dates,y:c.plain.values,type:"scatter",mode:"lines",line:{color:VIOLET,width:1.6},name:"Plain equity"},
+      {x:c.stop.dates,y:c.stop.values,type:"scatter",mode:"lines",line:{color:GREEN,width:2.6},name:"Stop-protected"},
+    ],{...LAY,height:300,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
+  }
+
+  // trailing-period returns: cap/stop lens use their own curve, else the daily backtest curve
+  PCURVE = CM ? {dates: scb.curve.capped.dates, basket: scb.curve.capped.values, nifty: scb.curve.index.values}
+         : SM ? {dates: slb.curve.stop.dates, basket: slb.curve.stop.values, nifty: slb.curve.index.values}
+         : b.curve;
+  PIDX = idxName;
   document.querySelectorAll("#pertoggle button").forEach(bn=>bn.onclick=()=>{
     document.querySelectorAll("#pertoggle button").forEach(x=>x.classList.toggle("on", x===bn));
     renderPeriod(bn.dataset.mo===""?null:+bn.dataset.mo);
   });
   renderPeriod(12);
 
+  document.querySelectorAll("#modetoggle button").forEach(bn=>bn.onclick=()=>{ const v=bn.dataset.v; STOPMODE=(v==="stop"); SECTORCAP=(v==="cap"); renderBasket(); });
   document.querySelectorAll("#idxtoggle button").forEach(bn=>bn.onclick=()=>{ CURINDEX=bn.dataset.i; renderBasket(); });
   document.querySelectorAll("#unitoggle button").forEach(bn=>bn.onclick=()=>{ CURUNI=bn.dataset.u; renderBasket(); });
   document.querySelectorAll("#cadtoggle button").forEach(bn=>bn.onclick=()=>{ CURCAD=bn.dataset.c; renderBasket(); });
@@ -337,6 +438,10 @@ async function renderBasket(){
   document.querySelectorAll("#basket tbody tr[data-sym]").forEach(r=>r.onclick=()=>{switchView("stocks");selectStock(r.dataset.sym);});
 }
 const metric = (k,v,sub,c="") => `<div class="metric"><div class="k">${k}</div><div class="v ${c}">${v}</div><div class="sub">${sub}</div></div>`;
+// stop-loss before/after cell — higher is better for all four (CAGR, Sharpe, Calmar, and a less-negative Max DD)
+const stopM = (k,plain,stop,suf,dec) => { const better = stop>=plain, d=stop-plain;
+  return `<div class="metric"><div class="k">${k}</div><div class="v ${better?"up":"down"}">${fmt(stop,dec)}${suf}</div>
+    <div class="sub">plain ${fmt(plain,dec)}${suf} · ${better?"▲":"▼"}${fmt(Math.abs(d),dec)}${suf}</div></div>`; };
 
 // ---- trailing-period returns from the daily backtest curve ----
 let PCURVE = null, PIDX = "";
@@ -510,7 +615,12 @@ async function renderCompareAll(){
 }
 
 // ==================== EQUINEXT DYNAMIC (valuation-momentum + 3-asset switch) ====================
-let DYNIDX="n750", DYNWIN="rc", DYNCAP="", DYNSTRAT="", DYNPER="1Y", DYNV=null;
+let DYNIDX="n750", DYNWIN="rc", DYNCAP="", DYNSTRAT="", DYNPER="1Y", DYNV=null, DYNTIMING="index";
+// one before/after cell for the timing comparison: `active` big, the other signal beneath.
+// higher is better for CAGR/Sharpe/Calmar and for a less-negative Max DD; avg-equity is neutral.
+const tTile=(k,active,other,otherLbl,suf,dec,neutral=false)=>{ const better=active>=other;
+  return `<div class="metric"><div class="k">${k}</div><div class="v ${neutral?"":(better?"up":"down")}">${fmt(active,dec)}${suf}</div>
+    <div class="sub">${otherLbl} ${fmt(other,dec)}${suf}</div></div>`; };
 // Resolve the variant key for a universe under the current strategy/cap toggles.
 // DYNSTRAT is "" (base), "v2" (multi-layer) or "v2c" (Mode C).
 const dynKey = (u, wk) => DYNSTRAT ? (u+DYNSTRAT+"_"+wk) : (u+DYNCAP+"_"+wk);
@@ -590,6 +700,36 @@ async function renderDynamic(){
     {n:5, title:"Risk caps", role:"Concentration control", why:"On the combined book: no sector above 25%, no single stock above 8% (waterfall redistribution).", criteria:["25% sector cap","8% stock cap"]},
     {n:6, title:"3-Asset dial", role:"Risk dial", why:"Wrap the equity book in the dynamic switch — a 35% equity core, a 40% equity↔debt sleeve and a 25% equity↔gold sleeve by 3-mo momentum. Equity floats 35–100%.", criteria:["35% equity core","40% eq↔debt · 25% eq↔gold","Debt ~6.5%/yr · Gold = GoldBees"]},
   ] : null;
+  // --- switch-signal comparison (index-timed vs sleeve-timed) on the CURRENT variant's own book ---
+  const tim = v.timing;
+  const timingCard = tim ? (()=>{
+    const A=tim.index.metrics, B=tim.sleeve.metrics, SL=DYNTIMING==="sleeve";
+    const act=SL?B:A, oth=SL?A:B, othLbl=SL?"index-timed:":"sleeve-timed:";
+    return `
+    <div class="card">
+      <h2>Switch signal · Index-timed vs Sleeve-timed <span class="pill sec" style="font-size:10px">design ablation</span></h2>
+      <div class="lead">Every month the dial decides equity↔debt and equity↔gold by comparing a <b>3-month equity momentum</b> against debt & gold. That equity momentum can read off the <b>broad Nifty 500 index</b> (what the <b>live baskets use</b>) or off the <b>equity sleeve's own returns</b>. Same book, both ways — on <b>${v.label}</b>, ${DYNWIN==="rc"?"RupeeCase window":"full window incl. COVID"}.</div>
+      <div class="btoggle" id="dyntiming" style="margin-top:4px">
+        <button data-t="index" class="${!SL?"on":""}">Index-timed<small>NIFTY 500 · live</small></button>
+        <button data-t="sleeve" class="${SL?"on":""}">Sleeve-timed<small>own momentum</small></button>
+      </div>
+      <div class="metrics" style="margin-top:12px">
+        ${tTile("Return (CAGR)", act.cagr, oth.cagr, othLbl, "%", 1)}
+        ${tTile("Sharpe", act.sharpe, oth.sharpe, othLbl, "", 2)}
+        ${tTile("Max Drawdown", act.maxdd, oth.maxdd, othLbl, "%", 1)}
+        ${tTile("Calmar", act.calmar, oth.calmar, othLbl, "", 2)}
+        ${tTile("Avg equity", act.avg_eq, oth.avg_eq, othLbl, "%", 0, true)}
+      </div>
+      <div class="legend" style="margin-top:14px"><span><b style="background:${GRAY}"></b>Nifty 500</span><span><b style="background:${GREEN}"></b>Index-timed</span><span><b style="background:${AMBER}"></b>Sleeve-timed</span></div>
+      <div id="dyntimingcurve" style="height:300px"></div>
+      <div class="gapnote" style="text-align:left">${(()=>{ const dSh=B.sharpe-A.sharpe, dDD=B.maxdd-A.maxdd;
+        const sleeveHelps = dSh>=0 && dDD>=-0.3;
+        return sleeveHelps
+          ? `<b>On this book, sleeve-timing edges ahead</b> (Sharpe ${fmt(B.sharpe,2)} vs ${fmt(A.sharpe,2)}, drawdown ${fmt(B.maxdd,1)}% vs ${fmt(A.maxdd,1)}%) — this sleeve is volatile enough that its <b>own</b> momentum de-risks faster than the broad index. But it isn't robust: on the broader <b>Total Market</b> / <b>Nifty 500</b> books (switch the universe above) the same signal holds equity into crashes and <b>worsens</b> the drawdown. The live baskets read the <b>index</b> because it's the dependable default across every universe — the whole point of a risk dial.`
+          : `<b>Here the index signal wins.</b> Sleeve-timing ${dDD<-0.3?`deepens the worst drawdown (${fmt(A.maxdd,1)}% → ${fmt(B.maxdd,1)}%)`:"barely moves the drawdown"}${dSh<0?` and cuts Sharpe (${fmt(A.sharpe,2)} → ${fmt(B.sharpe,2)})`:""}: the sleeve's own momentum is strongest just before a top, so it stays fully in equity into the fall. A <b>market-regime read (the broad index)</b> beats reading your own recent P&L — which is why the live baskets time off the index.`;
+      })()}</div>
+    </div>`; })() : "";
+
   const ddRow=r=>`<tr><td>${r.started}</td><td>${r.trough}</td><td>${r.recovered}</td>
     <td class="down"><b>${fmt(r.max_dd,1)}%</b></td><td>${r.duration_days} days</td></tr>`;
   const chips=(arr,cls)=>arr.map(x=>`<span class="tchip ${cls}">${x}</span>`).join("");
@@ -657,6 +797,8 @@ async function renderDynamic(){
       <div id="dyncurve" style="height:320px"></div>
     </div>
 
+    ${timingCard}
+
     ${v.periods?`<div class="card">
       <h2>Returns by period <span class="pill sec" style="font-size:10px">real backtest data</span></h2>
       <div class="lead">The CAGR above covers the whole backtest. Pick a trailing window below to see how <b>${v.label}</b> did versus the Nifty indices over just that stretch — computed straight from the daily backtest curve.</div>
@@ -717,6 +859,15 @@ async function renderDynamic(){
     {x:cs.nifty50.dates,y:cs.nifty50.values,type:"scatter",mode:"lines",line:{color:VIOLET,width:1.2},name:"Nifty 50"}];
   Plotly.newPlot("dyncurve",tr,{...LAY,height:320,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
 
+  if(tim){
+    const SL=DYNTIMING==="sleeve";
+    Plotly.newPlot("dyntimingcurve",[
+      {x:tim.bench.dates,y:tim.bench.values,type:"scatter",mode:"lines",line:{color:GRAY,width:1.5},name:"Nifty 500"},
+      {x:tim.index.curve.dates,y:tim.index.curve.values,type:"scatter",mode:"lines",line:{color:GREEN,width:SL?1.5:2.8},name:"Index-timed"},
+      {x:tim.sleeve.curve.dates,y:tim.sleeve.curve.values,type:"scatter",mode:"lines",line:{color:AMBER,width:SL?2.8:1.5},name:"Sleeve-timed"},
+    ],{...LAY,height:300,yaxis:{...LAY.yaxis,tickprefix:"₹"}},PLOT);
+  }
+
   renderSectorCharts(v.sector, "sec");
 
   DYNV=v;
@@ -727,6 +878,7 @@ async function renderDynamic(){
   });
   renderDynPeriod();
 
+  document.querySelectorAll("#dyntiming button").forEach(b=>b.onclick=()=>{ DYNTIMING=b.dataset.t; renderDynamic(); });
   document.querySelectorAll("#dynidx button").forEach(b=>b.onclick=()=>{ DYNIDX=b.dataset.i; renderDynamic(); });
   document.querySelectorAll("#dynstrat button").forEach(b=>b.onclick=()=>{ DYNSTRAT=b.dataset.s; renderDynamic(); });
   document.querySelectorAll("#dynwin button").forEach(b=>b.onclick=()=>{ DYNWIN=b.dataset.w; renderDynamic(); });

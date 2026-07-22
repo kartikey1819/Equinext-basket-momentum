@@ -25,11 +25,11 @@ except Exception:
 from equinext.context import ResearchContext                          # noqa: E402
 from equinext.backtest import BacktestConfig, run_backtest, Basket, Selection  # noqa: E402
 from baskets.valuation_momentum import (                              # noqa: E402
-    VM500Standard50, VMTotalMarket50, cap_weights,
+    VM500Standard50, VMTotalMarket50, VMRupeeCaseUniverse, cap_weights,
 )
 from scripts.backtest_allocator import run_switch, gold_returns, metrics  # noqa: E402
 
-CAPS = [("no cap", None), ("30% cap", 0.30), ("25% cap", 0.25), ("20% cap", 0.20)]
+CAPS = [("no cap", None), ("30% cap", 0.30), ("25% cap", 0.25), ("20% cap", 0.20), ("15% cap", 0.15)]
 RC_START = pd.Timestamp("2022-11-18")
 
 
@@ -44,9 +44,10 @@ class ReplayBasket(Basket):
         return self._sel[pd.Timestamp(as_of)]
 
 
-def sector_peak(holdings, sector_of):
-    """(peak single-sector weight ever, average largest-sector weight) in %."""
-    peak, tops = 0.0, []
+def sector_stats(holdings, sector_of):
+    """(peak single-sector weight, avg largest-sector weight, avg #sectors held) — the
+    last shows the diversification a tighter cap forces."""
+    peak, tops, nsec = 0.0, [], []
     for _, w in holdings.items():
         sw = {}
         for s, x in w.items():
@@ -55,21 +56,23 @@ def sector_peak(holdings, sector_of):
         mx = max(sw.values()) if sw else 0.0
         tops.append(mx)
         peak = max(peak, mx)
-    return peak * 100, (sum(tops) / len(tops) * 100 if tops else 0.0)
+        nsec.append(sum(1 for v in sw.values() if v > 0.005))    # sectors with >0.5% weight
+    n = len(holdings) or 1
+    return peak * 100, sum(tops) / n * 100, sum(nsec) / n
 
 
 def hdr(title):
-    print(f"\n{'='*118}\n{title}\n{'='*118}")
-    print(f"{'sector cap':<12}| {'FULL WINDOW (2017-, incl COVID)':^47} | {'RUPEECASE WINDOW (2022-)':^30} | {'concentration':^16}")
+    print(f"\n{'='*122}\n{title}\n{'='*122}")
+    print(f"{'sector cap':<12}| {'FULL WINDOW (2017-, incl COVID)':^47} | {'RUPEECASE WINDOW (2022-)':^30} | {'diversification':^20}")
     print(f"{'':<12}| {'CAGR':>6}{'Vol':>6}{'Sharpe':>7}{'Sortino':>8}{'maxDD':>7}{'Calmar':>7} | "
-          f"{'CAGR':>6}{'Sharpe':>7}{'maxDD':>7} | {'peak':>7}{'avgTop':>8}")
-    print("-" * 118)
+          f"{'CAGR':>6}{'Sharpe':>7}{'maxDD':>7} | {'peak':>6}{'avgTop':>7}{'avgSec':>7}")
+    print("-" * 122)
 
 
-def row(label, fm, rm, peak, avgtop):
+def row(label, fm, rm, peak, avgtop, avgsec):
     print(f"{label:<12}| {fm['cagr']:>5.1f}%{fm['vol']:>5.1f}%{fm['sharpe']:>7.2f}{fm['sortino']:>8.2f}"
           f"{fm['maxdd']:>6.1f}%{fm['calmar']:>7.2f} | {rm['cagr']:>5.1f}%{rm['sharpe']:>7.2f}{rm['maxdd']:>6.1f}% | "
-          f"{peak:>6.0f}%{avgtop:>7.0f}%")
+          f"{peak:>5.0f}%{avgtop:>6.0f}%{avgsec:>7.1f}")
 
 
 def main():
@@ -80,12 +83,13 @@ def main():
     sector_of = lambda s: ctx.sector(s)
     cfg = BacktestConfig(start=start.date(), end=end.date(), rebalance="ME")
 
-    universes = [("Nifty 500", VM500Standard50), ("Total Market", VMTotalMarket50)]
+    universes = [("Nifty 500", VM500Standard50), ("Total Market", VMTotalMarket50),
+                 ("RupeeCase", VMRupeeCaseUniverse)]
 
     for uni_label, cls in universes:
         print(f"\ncomputing base selections for {uni_label} ...", flush=True)
         base = run_backtest(cls(), ctx, cfg)                 # heavy: momentum selection, once
-        hdr(f"{uni_label} — 50-stock book + dynamic monthly 3-asset dial | sector WEIGHT cap sweep")
+        hdr(f"{uni_label} — 50-stock book + dynamic monthly 3-asset dial | 25% vs 15% sector cap")
         for cap_label, cap in CAPS:
             capped = {pd.Timestamp(d): cap_weights(w, sector_of, sector_cap=cap)
                       for d, w in base.holdings.items()}
@@ -96,8 +100,8 @@ def main():
             r_full, _ = run_switch(r_eq, rg, "NIFTY500", "ME")
             r_eq_rc = r_eq[r_eq.index >= RC_START]
             r_rc, _ = run_switch(r_eq_rc, rg, "NIFTY500", "ME")
-            peak, avgtop = sector_peak(capped, sector_of)
-            row(cap_label, metrics(r_full), metrics(r_rc), peak, avgtop)
+            peak, avgtop, avgsec = sector_stats(capped, sector_of)
+            row(cap_label, metrics(r_full), metrics(r_rc), peak, avgtop, avgsec)
 
 
 if __name__ == "__main__":

@@ -138,7 +138,7 @@ def metrics(r: pd.Series) -> dict:
 
 
 def run_switch(r_eq: pd.Series, r_gold: pd.Series, index_name: str, rebalance,
-               core=0.35, wA=0.40, wB=0.25, lookback=63):
+               core=0.35, wA=0.40, wB=0.25, lookback=63, eq_mom_series=None, return_weights=False):
     """RupeeCase-style dual-momentum dial. A fixed `core` equity sleeve, plus two
     SWITCH sleeves decided by RELATIVE MOMENTUM at each rebalance:
       switch A (wA): hold EQUITY if the equity index's trailing return beats debt's,
@@ -146,14 +146,22 @@ def run_switch(r_eq: pd.Series, r_gold: pd.Series, index_name: str, rebalance,
       switch B (wB): hold EQUITY if it beats gold's trailing return, else hold GOLD.
     So equity floats between `core` (both switches defensive) and core+wA+wB (both in
     equity). `lookback` = momentum window in trading days (63 ~ 3 months).
+
+    Equity-momentum source: by default the broad `index_name` benchmark (a clean, low-noise
+    market-regime read). Pass `eq_mom_series` (a date-indexed trailing-return series) to time
+    the switch off the equity SLEEVE's own momentum instead — used for the sleeve-vs-index
+    ablation. Default None -> unchanged (deployed baskets are index-timed).
     Returns (port_returns, avg_equity_weight)."""
     days = r_eq.index
     R = pd.DataFrame({"eq": r_eq,
                       "debt": pd.Series(DEBT_DAILY, index=days),
                       "gold": r_gold.reindex(days).fillna(0.0)})
-    idx = prices.load_benchmark(index_name, days[0] - pd.Timedelta(days=320), days[-1])
     gc = gold_close()
-    eq_mom = idx / idx.shift(lookback) - 1
+    if eq_mom_series is not None:
+        eq_mom = eq_mom_series
+    else:
+        idx = prices.load_benchmark(index_name, days[0] - pd.Timedelta(days=320), days[-1])
+        eq_mom = idx / idx.shift(lookback) - 1
     gold_mom = gc / gc.shift(lookback) - 1
     debt_mom = (1 + DEBT_YIELD) ** (lookback / 252) - 1
 
@@ -188,6 +196,8 @@ def run_switch(r_eq: pd.Series, r_gold: pd.Series, index_name: str, rebalance,
             first = False
         cur = w
     port = port.dropna()
+    if return_weights:
+        return port, eqw.reindex(port.index)                # full daily equity-weight series (0-1)
     return port, eqw.reindex(port.index).mean() * 100
 
 
